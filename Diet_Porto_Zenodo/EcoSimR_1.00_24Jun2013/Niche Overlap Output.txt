@@ -1,0 +1,19 @@
+Time Stamp:  Mon Oct 27 14:48:24 2025 
+Data File:  site_pair.csv 
+Output File:  Niche Overlap Output.txt 
+Random Number Seed:  -784099275 
+Number of Replications:  1000 
+Elapsed Time:  0.058 secs 
+Metric:  Pianka 
+Algorithm:  RA3 
+Observed Index:  0.81004 
+Mean Of Simulated Index:  0.31137 
+Variance Of Simulated Index:  0.041475 
+Lower 95% (1-tail):  0.077557 
+Upper 95% (1-tail):  0.81865 
+Lower 95% (2-tail):  0.064631 
+Upper 95% (2-tail):  0.85312 
+P(Obs <= null) =  0.947 
+P(Obs >= null) =  0.055 
+P(Obs = null) =  0.002 
+Standardized Effect Size (SES):  2.4486 

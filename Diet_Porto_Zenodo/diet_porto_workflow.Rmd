@@ -1,0 +1,3393 @@
+---
+title: "Urbanization shapes dietary composition and head morphology of salamanders (workflow)"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## 1. Initialize
+
+#### 1.1 Randomized seeds
+
+```{r}
+set.seed(4485)
+```
+
+#### 1.2 Load packages
+
+```{r}
+# if you want to learn more about dplyr and tidyverse, check here https://www.tidyverse.org/
+library(dplyr)
+library(tidyverse)
+library(vegan)
+library(ggplot2)
+library(ggfortify)
+library(ggpubr)
+library(patchwork)
+
+library(iNEXT)
+library(FactoMineR) # CA() for Correspondence Analysis 
+library(factoextra) # fviz_screeplot() to visualize eigenvalues 
+library(corrplot) # corrplot() for visualization of a correlation matrix
+
+```
+
+#### 1.3 Define directories
+
+```{r}
+# Setting directories ####
+dir_fwh1 <- "fwh1/" # set the path to data for fragment FWH1
+
+## output results
+dir_int <- "intermediate/" # set the path to output results
+
+unlink(dir_int, # clear existing
+       recursive = TRUE)
+dir.create(dir_int, # create
+           showWarnings = FALSE, recursive = TRUE)
+```
+
+## 2. Load Data
+
+### 2.1 Load sample info
+
+```{r}
+## Extraction results
+df_raw = 
+  read.csv("fwh1/porto.fwh1.sample-info.csv")
+
+```
+
+### 2.2 Number of pellets per site
+
+```{r}
+## pellets per site
+table(
+  df_raw[!df_raw$site == "",c("site")]
+  )
+
+```
+
+## 3. Filter Data
+
+```{r}
+# if using the inital BOLDigger result set to TRUE
+BOLDIGG.I = FALSE
+```
+
+
+### 3.1 load data
+
+```{r}
+## Load txt files to a list ####
+# path to folders containing txt files
+path <- list.files(path = dir_fwh1,
+                   pattern=".csv$", 
+                   full.names = TRUE)
+  
+files <- list()
+
+## Load OUT table
+files[[1]] <- read.table(path[grep("read-count",path)],
+                           header = TRUE,
+                           fill = TRUE,
+                           na.strings = c(""," ", "na"),
+                           sep = ",")
+
+## Load OTU id
+files[[2]] <- #read.table(path[grep("boldigger",path)], # A revised OTU list is used.
+              #           header = TRUE,
+              #           fill = TRUE,
+              #           na.strings = c("", " ", "na"),
+              #           sep = ",")
+  readxl::read_xlsx("boldigger_2025/salamanders_curated_OTUs_identification_result.xlsx","Sheet1")
+# change default value of ID to OTU
+colnames(files[[2]])[1] <- "otu" 
+# remove the '>' symbol preceeding the OTU
+#files[[2]][,1] <- as.factor(stringi::stri_replace_all(files[[2]][,1], 
+#                                                      replacement="",fixed = ">" ))
+
+##OPTIONAL
+if (BOLDIGG.I == TRUE){
+files[[2]] = read.csv("boldigger.prefilter.csv")
+}
+
+## Load Sample info
+files[[3]] <- read.csv(path[grep("sample-info",path)], # Select the full data
+                         header = TRUE,
+                         fill = TRUE,
+                         na.strings = c("", " ", "na"),
+                         sep = ",",
+                         quote = '')
+
+## verify all loaded
+if (length(files) == 3){
+  print("All good!")
+} else {
+  simpleError("Missing Files")
+}
+```
+
+### 3.2 Merge files
+
+```{r}
+# If using single date location data, remove samples with no site
+which(colnames(files[[1]]) %in% files[[3]]$sample) -> x
+files[[1]][,c(1:4,x)] -> files[[1]]
+
+## set files list names
+file.names <- c('otu.table.txt','otu.id.txt','sample.info.txt')
+
+names(files) <- file.names
+# NOTE: Be careful to check your file names as they might need to be updated accordingly 'files$NAME'
+```
+
+#### step 1 pivot read count
+
+```{r}
+### Step 1 ####
+  # Pivot OTU table So each line is the reads for each sample
+  merged.table <- files$otu.table.txt %>% 
+  pivot_longer(c(-(1:4)), 
+               names_to = 'sample', 
+               values_to = 'reads') %>% 
+  # Remove lines where the OTU is not found in a sample
+  filter(reads != 0)
+```
+
+#### step 2 join pivot table
+
+```{r}
+## Join the sample info by header sample
+merged.table <- left_join(merged.table, 
+                        files$sample.info.txt, 
+                        by = 'sample')
+```
+
+#### step 3 join otus
+
+```{r}
+### Step 3 ####
+  # Join the OTU id by OTU name
+  merged.table <- left_join(merged.table, 
+                            files$otu.id.txt,
+                            by = 'otu')
+```
+
+#### step 4 identify negatives
+
+```{r}
+  ### Step 4 ####
+  # Identify blanks/negatives as a new column
+  blanks <- merged.table %>% 
+    filter(type == 'extblank' | type == 'pcrblank') %>%
+    select(c('sample', 'otu', 'reads', 'type')) %>%
+    unite(blank, c('sample', 'otu'), remove = FALSE, sep = '') %>%
+    relocate(blank, .after = reads)
+  
+  head(blanks)
+```
+
+#### step 5 otu reads found in negatives
+
+```{r}
+### Step 5 ####
+  # Identify the number of reads for each extraction blank 
+  tmp <- blanks %>% 
+    filter(type == 'extblank')%>%
+    select(otu, reads) %>%
+    rename(extblankreads = reads) %>%
+    group_by(otu) %>%
+    summarise(sum(extblankreads)) 
+  colnames(tmp) <- c('otu','extblankreads')
+  
+  merged.table <- merge(merged.table, tmp , 
+                        by = 'otu', all = T)
+  
+  # Identify the number of reads for each PCR blank
+  tmp <- blanks %>% 
+    filter(type == 'pcrblank') %>%
+    select(otu, reads) %>%
+    rename(pcrblankreads = reads) %>%
+    group_by(otu) %>%
+    summarise(sum(pcrblankreads)) 
+  colnames(tmp) <- c('otu','pcrblankreads')
+  
+  merged.table <- merge(merged.table, tmp , 
+                        by = 'otu', all = T)
+  
+  rm(tmp)
+  
+  # replace NA in 'extblankreads' and 'pcrblankreads' by 0
+  merged.table <- merged.table %>%
+    mutate_at(vars(extblankreads, pcrblankreads), ~replace_na(.,0))
+  
+  # display example of filter
+  head(unique.data.frame(merged.table[,c("otu","extblankreads","pcrblankreads")]))
+```
+
+#### step 6 remove negative reads from all samples
+
+```{r}
+### Step6 ####
+  # Remove a number of reads from the sample 
+  # equal to the higher value of blank reads between Extraction and PCR Blanks
+  merged.table <- merged.table %>% 
+    mutate(blankfiltered.reads =  case_when(extblankreads >= pcrblankreads ~
+                                              reads-extblankreads,
+                                            extblankreads < pcrblankreads ~ 
+                                              reads-pcrblankreads,
+                                            TRUE ~ as.numeric(reads)))
+  
+  # Remove lines with no reads after filtering
+  merged.table <- merged.table %>%         
+    filter(blankfiltered.reads >  0)
+```
+
+#### step 7 designate deit phylum
+
+```{r}
+### Step7 ####
+  # Designate which Phylum are dietary
+  levels(merged.table$Phylum)
+  c("Annelida","Arthropoda","Mollusca") -> diet.phylum
+  merged.table$Phylum %in% diet.phylum -> merged.table$diet
+  
+  # Summarize the number of reads for dietary taxa per sample
+  diet_reads <- merged.table %>% 
+    filter(diet == TRUE) %>% 
+    drop_na(blankfiltered.reads) %>%
+    group_by(sample) %>% 
+    summarize(diet.reads = sum(blankfiltered.reads))
+```
+
+#### step 8 count dietart reads per sample
+
+```{r}
+### Step8 ####
+  # Add the number of dietary reads per sample to each line
+  merged.table <- merged.table %>% left_join(diet_reads,
+                                             by = 'sample') %>%
+    rename(total.diet.reads = diet.reads)
+```
+
+#### step 9 read length filter
+
+```{r}
+### Step9 ####
+## Identify distribution of read lengths
+bp.length <- ggplot(merged.table, aes(x=type, y=seq_length)) + 
+  geom_boxplot()
+# Make a function to find the MODE
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+## Box plot with jittered points
+bp1 <- list()
+bp.length + geom_jitter(shape=16, position=position_jitter(0.2)) +
+  labs(title=paste("Length of reads."),x="OTUs", y = "Length (bp)") +
+  stat_summary(fun=getmode, geom="point", shape=23, size=4) +
+  theme_minimal() -> bp1
+
+## Filter reads that are blanks
+merged.table <- merged.table %>% mutate(
+  diet.status =  case_when(type == 'extblank' | 
+                             type == 'pcrblank' |
+                             # Non-diet OTUs
+                             diet == FALSE |
+                             # low match percentage
+                             as.numeric(as.character(merged.table$Similarity))  < 90 |
+                             # Fewer than 100 reads
+                             #total.diet.reads < 100 | # SUSPENDED
+                             # Less than 1% of the total reads
+                             blankfiltered.reads < 0.01*total.diet.reads ~ 'delete',
+                           TRUE ~ 'ok'
+                           )
+  )
+# summary
+bp1
+noquote(paste(
+  "Median fragment lenght:",
+  median(merged.table$seq_length)
+  ))
+```
+
+#### step 10 designate which reads are detary
+
+```{r}
+## Step10 ###
+  # Filtered reads as proportion of total dietary reads
+  merged.table$'%reads' <-  merged.table$blankfiltered.reads/merged.table$total.diet.reads
+  # Set errors as NA
+  merged.table$'%reads'[merged.table$'%reads' <= 0] <- NA
+  
+  # Filter reads by a given condition
+  merged.table <- merged.table %>% 
+    filter(diet.status == 'ok')
+  
+```
+
+#### step 11 filter reads by proportion of total
+
+```{r}
+## Step11 ###
+## Filtered reads as proportion of total dietary reads
+merged.table$'%reads' <-  merged.table$blankfiltered.reads/merged.table$total.diet.reads
+## Set errors as NA
+merged.table$'%reads'[merged.table$'%reads' <= 0] <- NA
+
+## Filter reads by a given condition
+merged.table <- merged.table %>% 
+  filter(diet.status == 'ok')
+
+## Remove samples with fewer than 100dp total dietary reads
+merged.table <- merged.table[merged.table$total.diet.reads>100,]
+# list of sites
+levels(as.factor(merged.table$site)) -> site_names
+#Identify sites with more than 2 observations
+site_names[
+  table(
+    merged.table[!duplicated(merged.table[c("site","sample")]),"site"])>2
+] -> site.n2
+merged.table <- merged.table[merged.table$site %in% site.n2,]
+```
+
+#### step 12 designate prey id
+
+```{r}
+## Step12 ###
+merged.table =
+merged.table[!is.na(merged.table$Genus) & 
+                      merged.table$Similarity > 97 &
+                      !is.na(merged.table$Similarity),] %>%
+  ## Identify Family when Genus is unknown
+  mutate(prey.id = coalesce(
+    Genus,
+    Family,
+    Order,
+    Class,
+    Phylum
+    )) 
+```
+
+#### save table
+
+```{r}
+# save results
+write.table(merged.table, file = paste0(dir_int, 
+                                          "/merged.table.fwh1.txt"),
+              sep = '\t',
+              row.names = FALSE)
+  
+  
+
+# summary
+noquote(paste(
+  "Final No. OTUs:",length(unique(merged.table$otu))
+))
+noquote(paste(
+  "Number of samples per site"
+))
+table(unique.data.frame(merged.table[,c("site","sample")])[,1])
+  
+```
+
+
+#### Prey Images 
+
+```{r}
+
+
+prey_img_lists <- list(taxa = c("Armadillidium","Lumbricus","Eluma","Milax","Allolobophora","Nalassus","Opogona",
+  "Porcellio","Nemobius","Polydesmus","Aporrectodea","Bimastos","Platycheirus"),
+                url = c("https://images.phylopic.org/images/cc116ca2-836f-41b2-995e-fe6e778e673a/thumbnail/64x64.png?v=1734e8073cd", #Armadillidium
+    "https://images.phylopic.org/images/f0d839a1-5a3e-42b2-828a-c5e536f0f7b7/thumbnail/64x64.png?v=186e838e1e6", #Lumbricus
+    "https://images.phylopic.org/images/cc116ca2-836f-41b2-995e-fe6e778e673a/thumbnail/64x64.png?v=1734e8073cd", #Eluma
+    "https://images.phylopic.org/images/2df5ac90-523f-4071-8f92-4181b94dd04e/thumbnail/64x64.png?v=188a5e24d2c", #Milax
+    "https://images.phylopic.org/images/f0d839a1-5a3e-42b2-828a-c5e536f0f7b7/thumbnail/64x64.png?v=186e838e1e6", #Allolobophora
+    "https://images.phylopic.org/images/1db0fa73-aa78-4483-96fb-d1b0701f40cb/thumbnail/64x64.png?v=191fda82151", #Nalassus
+    "https://images.phylopic.org/images/fae32bfc-d417-411d-be36-aea22c4a4a07/thumbnail/64x64.png?v=147f164d44f", #Opogona
+    "https://images.phylopic.org/images/cc116ca2-836f-41b2-995e-fe6e778e673a/thumbnail/64x64.png?v=1734e8073cd", #Porcellio
+    "https://images.phylopic.org/images/6e42ac62-37f4-458c-bf44-3f7decb1f14e/thumbnail/64x64.png?v=1889e0a1218", #Nemobius
+    "https://images.phylopic.org/images/3ca7d0e6-4c15-48bb-b770-5da52d548197/thumbnail/64x64.png?v=189105e73f5", #Polydesmus
+    "https://images.phylopic.org/images/f0d839a1-5a3e-42b2-828a-c5e536f0f7b7/thumbnail/64x64.png?v=186e838e1e6", #Aporrectodea
+    "https://images.phylopic.org/images/f0d839a1-5a3e-42b2-828a-c5e536f0f7b7/thumbnail/64x64.png?v=186e838e1e6", #Bimastos
+    "https://images.phylopic.org/images/fb360445-4c23-452e-b43d-34b42ce449dd/raster/1024x807.png?v=198460cf897"  #Platycheirus
+  ))
+    
+prey_img <- as.data.frame(prey_img_lists)
+
+```
+
+
+## 4. Replicates
+
+Duplicate to permit modification
+
+```{r}
+prey.table = merged.table
+```
+
+### 4.1 Compare Replicates
+
+```{r}
+# Restrict the data to just replicates
+prey.table[prey.table$type=="replicate",] -> replicate.table
+# Create new variable that is just the sample name
+substr(replicate.table[replicate.table$type=="replicate",]$sample,1,8) ->
+  replicate.table$rep_sample
+# source of replicate samples
+levels(as.factor(replicate.table$rep_sample)) ->
+  replicate.samples
+
+# Generate lists to save results 
+incidence_rep_raw <- list() # list of samples with prey occurrence/absence
+## First we want to detect species presence (0,1) in each sample and by group
+for ( i in seq_along(replicate.samples)){
+  # Index of variable
+  incidence_rep_raw[[i]] <- replicate.table %>%
+    # Apply filters
+    filter(diet.status == "ok" & 
+            replicate.table[,"rep_sample"]==replicate.samples[i]
+             ) %>%
+    # Select the level of prey
+    select(prey.id, sample, blankfiltered.reads) %>%
+    #summarise(reads = sum(blankfiltered.reads)) %>%
+    group_by(prey.id, sample) %>%
+    unique.data.frame() %>%
+    mutate_if(is.numeric, ~1 * (. > 0)) %>%
+    pivot_wider(names_from = sample, values_from = blankfiltered.reads, values_fn = mean) %>%
+    mutate_if(is.numeric, replace_na, 0) %>%
+    mutate(total = mean(c_across(where(is.numeric)))) %>%
+    as.data.frame()
+}
+# summary
+saveRDS(
+incidence_rep_raw %>%
+  reduce(full_join, by="prey.id") %>%
+  select(prey.id,contains("total")) %>%
+  `colnames<-`(c("prey",replicate.samples)),
+paste0(dir_int,"SM_replicate_matches.RDS"))
+
+```
+
+### 4.2 Remove Replicates
+
+From this step onward, we remove replicates for subsequent analysis.
+
+```{r}
+# list of replicates to remove, all from earliest reaction
+c("CID.P.07.4","PAV.N.18.4","POR.P.02.5","POR.P.03.3","POR.P.03.6","POR.P.09.4") -> x
+prey.table[!prey.table$sample %in% x,]->prey.table
+
+# remove replicate tags from samples
+substr(prey.table$sample,1,8) ->
+  prey.table$sample
+
+# write to outfile
+write.csv(prey.table,
+          file = 'intermediate/working.table.txt',
+            sep = '\t',
+            row.names = FALSE)
+```
+
+### [Optional] repeat analysis with only one sample date
+
+```{r, eval=FALSE}
+dim(prey.table)
+table(
+  unique.data.frame(prey.table[,c("sample","site","date_sample")])[,2:3]
+                    )
+# select which to remove
+prey.table = 
+  prey.table[ !(prey.table$site == "Mindelo" & prey.table$date_sample == "2022-10-19") , ]
+dim(prey.table)
+prey.table = 
+  prey.table[ !(prey.table$site == "Parque Cidade do Porto" & prey.table$date_sample == "2022-11-03") , ]
+dim(prey.table)
+prey.table = 
+  prey.table[ !(prey.table$site == "Parque Cidade Oriental" & prey.table$date_sample == "2022-11-16") , ]
+dim(prey.table)
+prey.table = 
+  prey.table[ !(prey.table$site == "Ramalde" & prey.table$date_sample == "2022-11-08") , ]
+dim(prey.table)
+prey.table = 
+  prey.table[ !(prey.table$site == "Sr. Matosinhos" & prey.table$date_sample == "2022-10-16"), ]
+dim(prey.table)
+
+table(
+  unique.data.frame(prey.table[,c("sample","site","date_sample")])[,2:3]
+  )
+
+```
+
+### 4.3 Simplify site names
+
+```{r}
+df.input = prey.table
+
+# simplify site names
+df.input$site = dplyr::recode(df.input$site,
+                              "Malta" = "Malta",
+                              "Mindelo" = "Mindelo",
+                              "Parque Avioso" = "P.Avioso",
+                              "Parque Cidade do Porto" =   "P.Cidade",
+                              "Parque Cidade Oriental" =    "P.Oriental",
+                              "Parque Real" = "P.Real",
+                              "Ramalde" = "Ramalde",
+                              "Sr. Matosinhos" =    "Matosinhos"
+                              )
+
+
+```
+
+```{r}
+df_tmp.ind =
+readxl::read_xlsx("Feces_Porto_2022.xlsx","sites") %>%
+  select(Site,Dates,Individuals) %>%
+  group_by(Site, Dates) %>%
+  group_by(Site) %>%
+  summarise(sum.Ind = sum(Individuals),
+            min.Ind = min(Individuals),
+            max.Ind = max(Individuals)) 
+
+df_tmp =
+merge( 
+  as.data.frame(table(unique.data.frame(files$sample.info.txt[,c("sample","site")])[,2])),
+  as.data.frame(table(unique.data.frame(files$sample.info.txt[,c("site","date_sample")])[,1])),
+  by = "Var1"
+)
+colnames(df_tmp) = c("site","n.pellets","n.visitations")
+df_tmp =
+merge( 
+  df_tmp,
+  df_tmp.ind[,1:2],
+  by.x = "site",by.y = "Site"
+)
+df_tmp =
+  merge(
+  df_tmp,
+  files$sample.info.txt[,c("site","lat","lon")]%>%
+  group_by(site) %>%
+  filter(row_number()==1)
+)
+colnames(df_tmp) = c("site","n.pellets","n.visitations","n.individuals","latitude","longitude")
+write_rds(df_tmp,"SM_pellet_collection.Rds")
+```
+
+
+### [Optional] Mindelo sperated into two sites by visitation
+
+Mindelo was visited twice, but unlike other sites repeatedly visited, it is larger and was approached from two separate directions, first from the south, then the north.
+
+```{r, eval=FALSE}
+unique.data.frame(df.input[,c("site","date_sample")])
+
+# first visitaion is now south
+df.input[df.input$site == "Mindelo" & df.input$date_sample == "2022-10-19",]$site =
+  str_replace_all(df.input[df.input$site == "Mindelo" & df.input$date_sample == "2022-10-19",]$site,
+                  "Mindelo","Mindelo.S") 
+# second visitaion is now north
+df.input[df.input$site == "Mindelo" & df.input$date_sample == "2022-11-09",]$site =
+  str_replace_all(df.input[df.input$site == "Mindelo" & df.input$date_sample == "2022-11-09",]$site,
+                  "Mindelo","Mindelo.N") 
+```
+
+## 5. Prey Diversity
+
+Define sites as the comparison
+
+```{r}
+v = "site"
+cond = unique(df.input[,v])
+```
+
+### 5.1 incidence table
+
+```{r}
+# First we want to detect species presence (0,1) in each sample and by group
+incidence_raw <- list()
+# Index of variable
+for (i in seq_along(cond)){
+  incidence_raw[[i]] <- df.input %>%
+    # Apply filters
+    filter(diet.status == "ok" & 
+             df.input[,v] == cond[i]
+             ) %>%
+    # Select the level of prey
+    dplyr::select(prey.id, sample, blankfiltered.reads) %>%
+    group_by(prey.id, sample) %>%
+    unique.data.frame() %>%
+    #summarise(reads = sum(total.diet.reads)) %>%
+    mutate_if(is.numeric, ~1 * (. > 0)) %>%
+    pivot_wider(names_from = sample, values_from = blankfiltered.reads, values_fn = mean) %>%
+    mutate_if(is.numeric, replace_na, 0) %>%
+    as.data.frame()
+}
+
+## iNetx requires that species are set as row names
+for (i in seq_along(cond)){
+  row.names(incidence_raw[[i]]) <- incidence_raw[[i]]$prey.id
+  incidence_raw[[i]]$prey.id <- NULL
+}
+
+## create iNEXT incidence_raw
+names(incidence_raw) <- cond
+
+## create iNEXT incidence_frequency object
+incidence_freq <- lapply(incidence_raw, as.incfreq)
+```
+
+### 5.2 prey occurrence
+
+```{r}
+## Identify presence of each prey by taxonomic hierarchy
+prey.data <- df.input %>%
+  # Apply filters
+  filter(diet.status == "ok") %>%
+  dplyr::select(prey.id,sample,
+         Phylum, Class, Order, Family, Genus, 
+         blankfiltered.reads) %>%
+  unique.data.frame() %>%
+  mutate_if(is.numeric, ~1 * (. > 0)) %>%
+  group_by(Phylum, Class, Order, Family, Genus,prey.id) %>%
+  summarize(count=sum(blankfiltered.reads)) %>%
+  arrange(Phylum, Class, Order, Family, Genus, prey.id) %>%
+  as.data.frame()
+prey.data[1:5,]
+```
+
+
+```{r}
+sm_otu_summary =
+right_join(
+  
+right_join(
+  unique.data.frame(files[[2]][
+    with(files[[2]],order(Phylum,Class,Order,Family,Genus)),
+    c("Phylum","Class","Order","Family","Genus")]) %>%
+      filter(!is.na(Genus)),
+  
+  merge.data.frame(
+  # n.otu per genus
+  files[[2]][files[[2]]$otu %in% df.input$otu,] %>%
+  count(Genus), # number of OTUs per genus
+  # minimum sumilarity of otus
+  files[[2]][files[[2]]$otu %in% df.input$otu,] %>%
+  group_by(Genus) %>%
+  summarize(Min.similarity = min(Similarity, na.rm=TRUE))
+  )
+  ) %>%
+  filter(!is.na(Genus)) %>%
+  filter(Min.similarity >= 97),
+      
+prey.data[,c("Genus","count")]
+
+)
+
+colnames(sm_otu_summary) = c(colnames(sm_otu_summary)[1:5],"n OTUs", "Min Similarity","% samples")
+sm_otu_summary$`% samples` = round(sm_otu_summary$`% samples` / length(unique(df.input$sample)) *100,1)
+
+write_rds(sm_otu_summary, paste0(dir_int,"SM_prey_FreqOccurence.Rds"))
+
+table(sm_otu_summary$Phylum)
+```
+
+
+### 5.3 Hill numbers
+
+A total of nine different measures of prey diversity are going to be considered, three for each Hill number (Hill, where 0 == empirical; 1 == Shannon; 2 == Simpson) and three rarefied diversity value therein therein (Div, 0 = asymptotic richness; 1 = minimum SC from sites; 2 = twice the minimum SC from sites).
+
+[iNEXT](https://johnsonhsieh.github.io/iNEXT/inst/doc/Introduction.html) encounters errors when only two species are encountered, which excluded Parque Real from working in the estimate.
+
+#### Global Estimates
+
+```{r}
+# set a series of sample sizes (m) for R/E computation
+m = seq(1, 50, by=1)
+
+f <- function(x) {
+    list(dim = ncol(x))
+}
+
+df_dim =
+  unlist(lapply(incidence_raw, f))
+
+df_patch = read.csv("patch_data.csv")
+
+df_patch_out = df_patch %>%
+  mutate(area_50m = area_50m / 10000) %>%
+  mutate(across(where(is.numeric), round, 1))
+colnames(df_patch_out) = c("Site","Search Area (ha)", 
+                           "IS 100m", "IS 200m", "IS 400m",
+                           "TC 100m", "TC 200m", "TC 400m",
+                           "WF 100m", "WF 200m", "WF 400m")
+
+write.csv(df_patch_out,paste0(dir_int,"df_patch.csv"))
+```
+
+Incidence‐raw data (datatype="incidence_raw"): for each assemblage, input data for a reference sample consist of a species‐by‐sampling‐unit matrix; when there are N assemblages, input data consist of N lists of matrices, and each matrix is a species‐by‐sampling‐unit matrix.
+
+```{r}
+# run iNEXT
+out1 <- iNEXT(incidence_raw[df_dim>=10], 
+                   q = c(0,1,2), datatype = 'incidence_raw', 
+              size = m, 
+              se = T)
+write.csv(out1$AsyEst, paste0(dir_int,"site_richness.csv"))
+out1$DataInfo
+## Visualize iNEXT
+ggiNEXT(out1, type = 1)
+  ggsave(paste0(dir_int,v,"_inext.jpeg"),
+       last_plot(),
+       device = "png",
+       dpi = 300, height = 15, width = 30, units = "cm")
+par(mfrow = c(1, 3))    
+ggiNEXT(out1, type = 1)
+ggiNEXT(out1, type = 2)
+ggiNEXT(out1, type = 3)
+
+ggiNEXT(out1, type=1, facet.var="Order.q", grey=FALSE)
+
+# sort by imperviousness
+out1$AsyEst
+
+
+out1$AsyEst$Assemblage = as.factor(out1$AsyEst$Assemblage)
+#out1$AsyEst$Assemblage = factor(out1$AsyEst$Assemblage, levels = imperviousness_order)
+
+out1$AsyEst = out1$AsyEs[order(out1$AsyEs$Assemblage),]
+
+# Sample‐size‐based R/E curves, separating by "site""
+g = ggiNEXT(out1, type=1, facet.var="Assemblage", grey=TRUE) + 
+  theme(plot.title = element_blank())
+
+g10 = g + 
+  ggthemes::theme_few() +       
+    scale_fill_grey(start = 0, end = .4) +
+    scale_colour_grey(start = .2, end = .2) +
+    theme(legend.position="bottom",
+          plot.title = element_blank(),
+          legend.title=element_blank(),
+          limits=c("0","50","75")) +
+  ylab("Prey diversity") +
+  scale_x_continuous(name="Number of Sampled Pellets")
+
+g10
+
+ggsave(
+  paste0(dir_int,v,"_hill_number_diversity.jpeg"),
+    last_plot(),
+    device = "png",
+    dpi = 300, height = 10, width = 40, units = "cm")
+
+
+# diversity estimates
+out1$AsyEst
+```
+
+#### Highest Observed SC
+
+```{r}
+## Estimate Shannon Diversity at highest observed sample coverage.
+out1$iNextEst$coverage_based[out1$iNextEst$coverage_based$Method=="Observed" & 
+                             out1$iNextEst$coverage_based$Order.q==1,]
+
+## Estimate Shannon Diversity at highest observed sample coverage.
+out1$iNextEst$coverage_based[out1$iNextEst$coverage_based$Method=="Observed" & 
+                             out1$iNextEst$coverage_based$Order.q==0,]
+```
+
+
+### 5.4 Extrapolation Thresholds
+
+#### Minimum Observed SC
+
+```{r}
+out1$DataInfo
+
+# minimum SC from among sites
+SCmin = min(out1$DataInfo$SC)
+
+SCmin
+
+```
+
+#### Asymptote Estimate
+
+```{r}
+# asymptotic values
+df_Asym = out1$AsyEst
+df_Asym[df_Asym == "Species richness"] = 0
+df_Asym[df_Asym == "Shannon diversity"] = 1
+df_Asym[df_Asym == "Simpson diversity"] = 2
+colnames(df_Asym) = c("Site","Order.q","Observed", "qD.Asy","SE.Asy","LCL.Asy","UCL.Asy")
+```
+
+#### Min SC
+
+```{r}
+# min SC values
+df_minSC = 
+out1$iNextEst$coverage_based %>%
+    group_by(Assemblage,Order.q) %>% # Group by the condition column
+    mutate(differences = abs(SC - SCmin)) %>% # Calculate absolute difference
+    filter(differences == min(differences)) %>% # Filter rows with the smallest difference
+    select(-differences) %>% # Remove the temporary difference column
+    ungroup() # Ungroup to return a regular data frame
+colnames(df_minSC) = c("Site","minSC","mint","Method","Order.q","qD.minSC","LCL.minSC","UCL.minSC")
+```
+
+#### Max SC
+
+```{r}
+# min SC * 2 values
+df_maxSC = 
+  out1$iNextEst$coverage_based %>%
+    group_by(Assemblage,Order.q) %>% # Group by the condition column
+    mutate(differences = abs(SC - (SCmin * 2))) %>% # Calculate absolute difference
+    filter(differences == min(differences)) %>% # Filter rows with the smallest difference
+    select(-differences) %>% # Remove the temporary difference column
+    ungroup() # Ungroup to return a regular data frame
+colnames(df_maxSC) = c("Site","maxSC","maxt","Method","Order.q","qD.maxSC","LCL.maxSC","UCL.maxSC")
+
+df_diversity = merge(df_Asym,df_minSC,by=c("Site","Order.q")) %>%
+              merge(df_maxSC, by=c("Site","Order.q"))
+
+head(df_diversity[df_diversity$Order.q==1,])
+```
+
+```{r}
+df_diversity_long = df_diversity %>%
+  pivot_longer(
+    cols = starts_with("qD"),
+    names_to = "estimate",
+    values_to = "qD"
+  ) %>%
+  mutate(
+    lower_error = ifelse(estimate == "qD.Asy", LCL.Asy, ifelse(estimate == "qD.minSC", LCL.minSC, LCL.maxSC)),
+    upper_error = ifelse(estimate == "qD.Asy", UCL.Asy, ifelse(estimate == "qD.minSC", UCL.minSC, UCL.maxSC))
+  )
+
+ggplot(df_diversity_long %>% 
+         mutate(Site = forcats::fct_reorder(Site,desc(qD))) %>%
+         mutate(estimate = replace(estimate, estimate == "qD.maxSC", "qD.SC*2"))%>%
+         mutate(estimate = replace(estimate, estimate == "qD.minSC", "qD.SCmin")), 
+       aes(x = Site, y = qD)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) + # Plot the points
+  geom_errorbar(aes(ymin = lower_error, ymax = upper_error), width = 0.2,
+    position = position_dodge(width = 0.5)) + # Add error bars
+  labs(
+    x = "Site",
+    y = "Estimate"
+  ) +
+  facet_wrap(~Order.q+estimate, scales = "free_y") +
+  theme_classic() +
+  scale_color_manual(values = c("qD.Asy" = "#bdbdbd",
+                                "qD.maxSC"="#969696",
+                                "qD.minSC"="#636363")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+ggsave(paste0(dir_int,"SM_hillnumber_estimates.png"),last_plot())
+
+```
+Use and ANOVA to test whether the method or estimate used leads to significant varaince in the estimate.
+
+```{r}
+# Perform pairwise t-tests
+# by method
+pairwise.t.test(df_diversity_long$qD, interaction(df_diversity_long$Order.q), 
+                p.adjust.method = "bonferroni")
+# by estimate
+pairwise.t.test(df_diversity_long$qD, interaction(df_diversity_long$estimate), 
+                p.adjust.method = "bonferroni")
+# the interaction between them
+pairwise.t.test(df_diversity_long$qD, interaction(df_diversity_long$estimate, df_diversity_long$Order.q), 
+                p.adjust.method = "bonferroni")
+```
+
+Results suggest that the Simpson diversity estimate is significantly more conservative estimate than empirical species richness. The empirical species richness estimate is by far the most varied, while both the Shannon and Simpson Diversity estimates have much more conservative estimates. Shannon diversity estimate is not significantly different from either, but is much closer to the Simpson estimate.
+
+Among the estimate thresholds, the minimum SC threshold is significantly different from the asymptotic estimate. The maxSC estimate is not significant to either, however, it is based on a infrence of the data that doesn't necessarily correspond to the observed data.
+
+Asymptotic estimate of empirical species richness is different from most other estimates or methods, and should probably be avoided.
+
+
+### 5.5 Phylum Diversity
+
+#### ARTHROPODA
+
+```{r}
+# generate incidence table with minimum sample size and exclusive to pry phylum
+incidence_arth = incidence_raw[df_dim>=10]
+
+for (i in seq_along(incidence_arth)){
+incidence_arth[[i]] =
+  incidence_arth[[i]][rownames(incidence_arth[[i]]) %in% 
+                      unique(df.input[df.input$Phylum == 'Arthropoda',"prey.id"]),]
+}
+
+outARTH = iNEXT(incidence_arth, 
+                   q = c(0,1,2), datatype = 'incidence_raw', 
+              size = m, 
+              se = T)
+
+
+outARTH$DataInfo
+
+## Visualize iNEXT
+ggiNEXT(outARTH, type=1, facet.var="Order.q", grey=FALSE)
+
+# sort by imperviousness
+outARTH$AsyEst
+
+outARTH$AsyEst$Assemblage = as.factor(outARTH$AsyEst$Assemblage)
+#outARTH$AsyEst$Assemblage = factor(outARTH$AsyEst$Assemblage, levels = imperviousness_order)
+
+outARTH$AsyEst = outARTH$AsyEs[order(outARTH$AsyEs$Assemblage),]
+
+# Sample‐size‐based R/E curves, separating by "site""
+g = ggiNEXT(outARTH, type=1, facet.var="Assemblage", grey=TRUE) + 
+  theme(plot.title = element_blank())
+
+gARTH = g + 
+  ggthemes::theme_few() +       
+    scale_fill_grey(start = 0, end = .4) +
+    scale_colour_grey(start = .2, end = .2) +
+    theme(legend.position="bottom",
+          plot.title = element_blank(),
+          legend.title=element_blank(),
+          limits=c("0","50","75")) +
+  ylab("Prey diversity") +
+  scale_x_continuous(name="Number of Sampled Pellets")
+
+gARTH
+
+```
+
+#### MOLLUSCA
+
+```{r}
+# generate incidence table with minimum sample size and exclusive to pry phylum
+incidence_moll = incidence_raw[df_dim>=10]
+
+for (i in seq_along(incidence_moll)){
+incidence_moll[[i]] =
+  incidence_moll[[i]][rownames(incidence_moll[[i]]) %in% 
+                      unique(df.input[df.input$Phylum == 'Mollusca',"prey.id"]),]
+}
+
+outMOLL = iNEXT(incidence_moll, 
+                   q = c(0,1,2), datatype = 'incidence_raw', 
+              size = m, 
+              se = T)
+
+
+outMOLL$DataInfo
+
+## Visualize iNEXT
+ggiNEXT(outMOLL, type=1, facet.var="Order.q", grey=FALSE)
+
+# sort by imperviousness
+outMOLL$AsyEst
+
+outMOLL$AsyEst$Assemblage = as.factor(outMOLL$AsyEst$Assemblage)
+#outMOLL$AsyEst$Assemblage = factor(outMOLL$AsyEst$Assemblage, levels = imperviousness_order)
+
+outMOLL$AsyEst = outMOLL$AsyEs[order(outMOLL$AsyEs$Assemblage),]
+
+# Sample‐size‐based R/E curves, separating by "site""
+g = ggiNEXT(outMOLL, type=1, facet.var="Assemblage", grey=TRUE) + 
+  theme(plot.title = element_blank())
+
+gMOLL = g + 
+  ggthemes::theme_few() +       
+    scale_fill_grey(start = 0, end = .4) +
+    scale_colour_grey(start = .2, end = .2) +
+    theme(legend.position="bottom",
+          plot.title = element_blank(),
+          legend.title=element_blank(),
+          limits=c("0","50","75")) +
+  ylab("Prey diversity") +
+  scale_x_continuous(name="Number of Sampled Pellets")
+
+gMOLL
+
+```
+
+#### ANNELIDA
+
+```{r}
+# generate incidence table with minimum sample size and exclusive to pry phylum
+incidence_anne = incidence_raw[df_dim>=10]
+
+for (i in seq_along(incidence_anne)){
+incidence_anne[[i]] =
+  incidence_anne[[i]][rownames(incidence_anne[[i]]) %in% 
+                      unique(df.input[df.input$Phylum == 'Annelida',"prey.id"]),]
+}
+
+outANNE = iNEXT(incidence_anne, 
+                   q = c(0,1,2), datatype = 'incidence_raw', 
+              size = m, 
+              se = T)
+
+
+outANNE$DataInfo
+
+## Visualize iNEXT
+ggiNEXT(outANNE, type=1, facet.var="Order.q", grey=FALSE)
+
+# sort by imperviousness
+outANNE$AsyEst
+
+outANNE$AsyEst$Assemblage = as.factor(outANNE$AsyEst$Assemblage)
+#outANNE$AsyEst$Assemblage = factor(outANNE$AsyEst$Assemblage, levels = imperviousness_order)
+
+outANNE$AsyEst = outANNE$AsyEs[order(outANNE$AsyEs$Assemblage),]
+
+# Sample‐size‐based R/E curves, separating by "site""
+g = ggiNEXT(outANNE, type=1, facet.var="Assemblage", grey=TRUE) + 
+  theme(plot.title = element_blank())
+
+gANNE = g + 
+  ggthemes::theme_few() +       
+    scale_fill_grey(start = 0, end = .4) +
+    scale_colour_grey(start = .2, end = .2) +
+    theme(legend.position="bottom",
+          plot.title = element_blank(),
+          legend.title=element_blank(),
+          limits=c("0","50","75")) +
+  ylab("Prey diversity") +
+  scale_x_continuous(name="Number of Sampled Pellets")
+
+gANNE
+
+```
+
+```{r}
+df_patch = read.csv("patch_data.csv")
+
+saveRDS(
+df_patch %>%
+  select(Site,area_50m,imperv_400m,tree_200m,wood_100m) %>%
+  mutate(Ha = round(area_50m / 10000,1)) %>%
+  mutate(wood_100m = wood_100m * 100) %>%
+  mutate(IS = imperv_400m) %>%
+  mutate(TC = tree_200m) %>%
+  mutate(WC = wood_100m) %>%
+  select(Site,Ha,IS,TC,WC) %>%
+  filter(Site %in% out1$DataInfo$Assemblage),
+paste0(dir_int,"Table_env_proportions.Rds"))
+  
+
+```
+
+```{r}
+# SM output table
+df_list =  list(
+
+out1$DataInfo %>%
+  select(Assemblage,S.obs, SC) %>%
+  mutate(SC = SC * 100), 
+
+out1$iNextEst$coverage_based %>%
+  filter(Order.q == 1) %>% # Shannon's diversity
+  filter(SC <= SCmin) %>% # set SC cut-off
+  group_by(Assemblage) %>%
+  filter(SC == max(SC, na.rm=TRUE)) %>%
+  select(Assemblage,qD),
+
+outARTH$iNextEst$coverage_based %>%
+  filter(Order.q == 1) %>% # Shannon's diversity
+  filter(SC <= SCmin) %>% # set SC cut-off
+  group_by(Assemblage) %>%
+  filter(SC == max(SC, na.rm=TRUE)) %>%
+  select(Assemblage,qD),
+
+outANNE$iNextEst$coverage_based %>%
+  filter(Order.q == 1) %>% # Shannon's diversity
+  filter(SC <= SCmin) %>% # set SC cut-off
+  group_by(Assemblage) %>%
+  filter(SC == max(SC, na.rm=TRUE)) %>%
+  select(Assemblage,qD),
+
+outMOLL$iNextEst$coverage_based %>%
+  filter(Order.q == 1) %>% # Shannon's diversity
+  filter(SC <= SCmin) %>% # set SC cut-off
+  group_by(Assemblage) %>%
+  filter(SC == max(SC, na.rm=TRUE)) %>%
+  select(Assemblage,qD)
+)
+
+sm_shannomn_diversity = 
+  df_list %>% reduce(full_join, by='Assemblage') %>% mutate(across(where(is.numeric), round, 1)) 
+
+colnames(sm_shannomn_diversity) = c("Site","Obs","SC","Est.","Arth.","Anne.","Moll.")
+
+site_order=
+  df_patch %>%
+    filter(Site %in% out1$DataInfo$Assemblage) %>%
+    arrange(imperv_400m) %>%
+    select(Site)
+
+sm_shannomn_diversity = 
+  sm_shannomn_diversity[match(
+    site_order$Site,
+    sm_shannomn_diversity$Site),]
+
+saveRDS(sm_shannomn_diversity, paste0(dir_int,"SM_site_diversity_estimates.Rds"))
+```
+
+## 6. Linear Models
+
+### 6.1 Enviro. Variable Buffer
+
+Buffers around polygons are listed in degrees (0.0001 \~= 10m; 0.001 \~= 100m; 0.002 \~= 200m; 0.004 \~= 400m) with patch area drawn freehand and area estimated with a 10m buffer. The mean impervious surface, and tree cover were calculated within successive buffers (100m,200m,400m).
+
+```{r}
+
+df_patch_long = 
+  df_patch %>%
+  pivot_longer(
+    cols = ends_with("m"),
+    names_to = "condition",
+    values_to = "mean"
+  )
+
+df_patch_long$feature = sub("_.*", "", df_patch_long$condition)
+df_patch_long$buffer = sub(".*_", "", df_patch_long$condition)
+
+ggarrange(
+# plot tree
+ggplot(df_patch_long[df_patch_long$feature=="tree",], aes(x = interaction(buffer, feature), y = mean,  color = buffer)) +
+  geom_boxplot(position = position_dodge(width = 0.5), size = 3) + # Plot the points
+  labs(
+    title = "Mean Tree Cover",
+    x = "buffer",
+    y = "mean"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+# imperviousness
+ggplot(df_patch_long[df_patch_long$feature=="imperv",], aes(x = interaction(buffer, feature), y = mean,  color = buffer)) +
+  geom_boxplot(position = position_dodge(width = 0.5), size = 3) + # Plot the points
+  labs(
+    title = "Mean Imperviousness",
+    x = "buffer",
+    y = "mean"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+# wood
+ggplot(df_patch_long[df_patch_long$feature=="wood",], aes(x = interaction(buffer, feature), y = mean,  color = buffer)) +
+  geom_boxplot(position = position_dodge(width = 0.5), size = 3) + # Plot the points
+  labs(
+    title = "Prop Wood",
+    x = "buffer",
+    y = "mean"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+ncol = 4, nrow = 1,common.legend = T)
+
+```
+
+When examining one phylum richness at a time, consider also including the remaining phylum richness since the occurrence of one prey taxa in the diet may be affected by the occurrence of the others. Annelid may be less common, if the salamander has already eaten other taxa recently.
+
+```{r}
+# format input for model
+
+head(df_patch)
+
+df_d0 = df_diversity[df_diversity$Order.q == 0,]
+df_model_SpRich = merge(df_patch,df_d0,by = "Site")
+
+df_d1 = df_diversity[df_diversity$Order.q == 1,]
+df_model_Shannon = merge(df_patch,df_d1,by = "Site")
+
+df_d2 = df_diversity[df_diversity$Order.q == 2,]
+df_model_Simpson = merge(df_patch,df_d2,by = "Site")
+
+df_model_in = list(df_model_SpRich,df_model_Shannon,df_model_Simpson)
+names(df_model_in) = unique(out1$AsyEst$Diversity)
+
+```
+
+#### Scale variabales
+
+```{r}
+df_model_scaled =
+df_model_in$`Shannon diversity` %>% 
+  select(Site,area_50m,
+         imperv_100m,imperv_200m,imperv_400m,
+         tree_100m,tree_200m,tree_400m,
+         wood_100m,wood_200m,wood_400m) %>%
+  mutate(across(where(is.numeric), scale)) %>%
+  mutate(qD.minSC= df_model_in$`Shannon diversity`$qD.minSC)
+```
+
+#### Pearson correlations
+
+```{r}
+corr_matrix_scaled =
+  Hmisc::rcorr(
+    as.matrix(df_model_scaled[,-1]), 
+    type = "pearson")
+
+bfp = # calculate Bonferroni’s Correction
+summary(
+aov(qD.minSC ~ area_50m,
+    df_model_in$`Shannon diversity`)
+)
+
+cor_coef = 
+  merge(
+corr_matrix_scaled$r %>%
+  reshape2::melt() %>%
+  rename(R = value),
+corr_matrix_scaled$P %>%
+  reshape2::melt() %>%
+  rename(P = value)
+)
+
+png(paste0(dir_int,"SM_diversity_pearson_corr.png"))
+corrplot(corr_matrix_scaled$r,
+         method = "circle",         # Visualization method
+         diag = FALSE,
+         type = "upper",
+         p.mat = corr_matrix_scaled$P,
+         sig.level = bfp[[1]]$`Pr(>F)`[1],
+         pch.col = "white",
+         tl.col="black",
+         insig = 'label_sig'
+         )
+dev.off()
+
+```
+
+
+#### Linear Models by variable
+
+```{r}
+# generate a null model
+null = lm( qD.minSC ~ 1 ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+```
+
+```{r}
+df_AIC = data_frame(buffer = c('null','100m','200m','400m'))
+```
+
+##### Impervious surface
+
+```{r, warning=FALSE}
+# Variable buffer 
+lm_100  =  lm( qD.minSC ~ imperv_100m ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_100)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_200  =  lm( qD.minSC ~ imperv_200m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_200)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_400  =  lm( qD.minSC ~ imperv_400m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_400)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+a = AIC(null,lm_100,lm_200,lm_400) # Impervious surface @ 400m
+df_AIC$imperv = a$AIC
+```
+
+##### Treecover
+
+```{r, warning=FALSE}
+# Variable buffer 
+lm_100  =  lm( qD.minSC ~ tree_100m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_100)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_200  =  lm( qD.minSC ~ tree_200m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_200)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_400  =  lm( qD.minSC ~ tree_400m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_400)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+a = AIC(null,lm_100,lm_200,lm_400) # Tree cover @ 200m
+df_AIC$tree = a$AIC
+```
+
+##### Woodcover
+
+```{r, warning=FALSE}
+# Variable buffer 
+lm_100  =  lm( qD.minSC ~ wood_100m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_100)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_200  =  lm( qD.minSC ~ wood_200m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_200)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+lm_400  =  lm( qD.minSC ~ wood_400m  ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+x = summary(lm_400)
+c(x$adj.r.squared, x$coefficients[2,"Pr(>|t|)"])
+
+a = AIC(null,lm_100,lm_200,lm_400) # Woodcover @ 100m
+df_AIC$wood = a$AIC
+```
+
+```{r}
+df_AIC
+write.csv(
+  df_AIC %>%
+    rename(IS = imperv,
+           TC = tree,
+           WC = wood), 
+  paste0(dir_int,"env_aic_buffer.csv"))
+```
+
+### 6.2 Enviornment Colinearity
+
+Since many of the variables may be correlated, I will run a correlation test to see if any environrmental varaibles need to be removed to avoid colinearity.
+
+```{r}
+psych::pairs.panels(df_model_in$`Shannon diversity`[,c("area_50m","imperv_100m","tree_100m","wood_100m")])
+# which variable has the highest sum among correlations
+rowSums(abs(
+cor(
+  df_model_in$`Shannon diversity`[,c("area_50m","imperv_100m","tree_100m","wood_100m")]
+) )
+)
+
+psych::pairs.panels(df_model_in$`Shannon diversity`[,c("area_50m","imperv_200m","tree_200m","wood_200m")])
+# which variable has the highest sum among correlations
+rowSums(abs(
+cor(
+  df_model_in$`Shannon diversity`[,c("area_50m","imperv_200m","tree_200m","wood_200m")]
+) )
+)
+
+psych::pairs.panels(df_model_in$`Shannon diversity`[,c("area_50m","imperv_400m","tree_400m","wood_400m")])
+# which variable has the highest sum among correlations
+rowSums(abs(
+cor(
+  df_model_in$`Shannon diversity`[,c("area_50m","imperv_400m","tree_400m","wood_400m")]
+) )
+)
+
+
+cor(
+  df_model_in$`Shannon diversity`[,c("area_50m","imperv_400m","tree_200m","wood_100m")]
+)
+
+```
+
+At all buffers, impervious surface is the most correlated with all other variable. In this case it should probably be removed as it is going to cause co-linearity issues within the models.
+
+We can use a VIF model to identify NDVI as especially redundant and may therefore be suitable for removal.
+
+```{r}
+# linear model
+global_lm  =  lm( qD.minSC ~ area_50m + imperv_400m + tree_200m + wood_100m,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+summary(global_lm)
+car::vif(global_lm)
+
+as.data.frame( car::vif(global_lm) )
+
+# glm
+global_glm  =  glm( qD.minSC ~  area_50m + imperv_400m + tree_200m + wood_100m,
+            data = df_model_in$`Shannon diversity`)
+summary(global_glm)
+car::vif(global_glm)
+
+```
+
+VIF results suggest that regardless of model used Impervious Surface as it is the largest contributor to co-linearity.
+
+### 6.3 Selecting the Model
+
+##### [OPTIONAL] Visitation as Random Effect
+
+```{r, eval=FALSE}
+# count number of visitation
+df_visits = as.data.frame(table(unique.data.frame(df.input[,c("site","date_sample")])[,1]))
+# limit to site with extrapolated diversity 
+df_visits = df_visits[df_visits$Var1 %in% df_model_in$`Shannon diversity`$Site,]
+# sort and append to input
+df_model_in$`Shannon diversity`$visits = 
+  df_visits[match(df_model_in$`Shannon diversity`$Site,df_visits$Var1),"Freq"]
+```
+
+To select what type of model, we generate a general global model including all variables (except impervious surface due to co-linearity) at a 250m radius along with the area of the patch. The goal here is to compare a linear and negative binomial model to determine which would be more informative.
+
+#### linear model
+
+```{r, warning=FALSE}
+
+# LM AREA as FIXED EFFECT
+global_lm_fe =  lm( qD.minSC ~ area_50m + tree_200m + wood_100m ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+summary(global_lm_fe)
+#checking model fit
+DHARMa::testDispersion(global_lm_fe)
+DHARMa::simulateResiduals(global_lm_fe, plot = TRUE) # SIG
+
+# LM AREA as RANDOM EFFECT 
+global_lm_re  =  lm( qD.minSC ~ tree_200m + wood_100m + (1|area_50m),
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+summary(global_lm_re)
+#checking model fit
+DHARMa::testDispersion(global_lm_re)
+DHARMa::simulateResiduals(global_lm_re, plot = TRUE) # SIG
+
+AIC(global_lm_fe,global_lm_re) # FE < RE
+
+
+```
+
+#### generalized linear
+
+```{r, warning=FALSE}
+
+# NBGLM AREA is FIXED 
+global_glm_fe  =  glm( qD.minSC ~ area_50m + tree_200m + wood_100m,
+                       family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+summary(global_glm_fe)
+#checking model fit
+DHARMa::testDispersion(global_glm_fe)
+DHARMa::simulateResiduals(global_glm_fe, plot = TRUE) # SIG
+
+# NBGLM AREA is RANDOM
+global_glm_re  =  MASS::glm.nb( qD.minSC ~ tree_200m + wood_100m + (1|area_50m),
+            data = df_model_in$`Shannon diversity`)
+summary(global_glm_re)
+#checking model fit
+DHARMa::testDispersion(global_glm_re)
+DHARMa::simulateResiduals(global_glm_re, plot = TRUE) # SIG
+
+AIC(global_glm_fe,global_glm_re) # FE < RE
+
+```
+
+All models exhibit over-dispersion. AIC scores are better for all models when SEARCH AREA is a fixed effect. LM appears to work as well as a the GLM and better than GLNBM. Proceed with LM.
+
+The linear model appears to be the most informative, which is primarily informed by the patch area.
+
+```{r}
+ggplot(df_model_in$`Shannon diversity`, aes(x = area_50m, y = qD.minSC)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = LCL.minSC, ymax = UCL.minSC), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  # Plot the linear model (slope)
+  labs(
+    title = "area ~ Shannon diversity"
+  ) +
+  theme_minimal()
+
+```
+
+We know then, that when patch area is included it is the most informative model.
+
+### 6.4 Diversity thresholds
+
+Using the same negative binomial GLM model with NDVI and proportion of woody material, the models cease to be significant when applied to the 500m buffer. Additionally, using the Asymptotic Species Estimate is rarely significant, when compared to estimates based on the minimum or maximum sample coverage.
+
+Tree Cover was significantly correlated with Imperviousness and removed to exclude redundant variables.
+
+[SOURCE](https://boostedml.com/2019/06/linear-regression-in-r-interpreting-summarylm.html)
+
+Interpreting the model summary, Estimate: intercept for a variable when x = 0. Standard error of the estimate, can be calculated with *confint(model)*. t-value: How far our estimated parameter is from a hypothesized 0 value, scaled by the standard deviation of the estimate. Pr(\>\|t\|): The p-value for the individual coefficient. Instead of using the standard p-value of 0.05, we can use the Bonferroni correction and divide by the number of hypothesis tests, and thus set our p-value threshold to 0.01.
+
+Assessing Fit and Overall Significance, the residual standard error, the R\^2, and the F statistic and test. These tell us about how good a fit the model is and whether any of the coefficients are significant. Intuitively R\^2 tells us what proportion of the variance is explained by our model, both R\^2 and the residual standard standard deviation tells us about how well our model fits the data. F-Statistic and F-test identify if at least one feature has a significant effect. That is, we would like to test the null hypothesis that all coefficients are 0 against the alternative hypothesis Under the null hypothesis the F statistic will be F distributed with (p-1,n-p) degrees of freedom. The probability of our observed data under the null hypothesis is then the p-value. If we use the F-test alone without looking at the t-tests, then we do not need a Bonferroni correction, while if we do look at the t-tests, we need one.
+
+### 6.5 Global Model
+
+```{r}
+# generate a null model
+null = MASS::glm.nb( qD.minSC ~ 1,
+            data = df_model_in$`Shannon diversity`)
+  
+#global model 
+global  =  MASS::glm.nb( qD.minSC ~ tree_200m + wood_100m + (1|area_50m),
+            data = df_model_in$`Shannon diversity`)
+
+summary(global)
+#checking model fit
+DHARMa::simulateResiduals(global, plot = TRUE)
+
+## simplify
+drop1(global) # Tree
+global2  =  MASS::glm.nb( qD.minSC ~ area_50m + wood_100m,
+            data = df_model_in$`Shannon diversity`)
+anova(global, global2) # n.s.
+AIC(global, global2) # global2
+
+drop1(global2) # wood
+
+anova(global2, null) # sig
+AIC(global2, null) # global3
+
+summary(global2)
+
+```
+
+```{r, warning=FALSE}
+# generate a null model
+null = lm( qD.minSC ~ 1 ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+  
+#global model 
+global  =  lm( qD.minSC ~ area_50m + tree_200m + wood_100m,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+summary(global)
+
+## simplify
+drop1(global) # Tree
+global2  =  lm( qD.minSC ~ area_50m + wood_100m,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+anova(global, global2) # n.s.
+AIC(global, global2) # global2
+
+drop1(global2) # wood
+global3  =  lm( qD.minSC ~ area_50m ,
+            family = poisson ,
+            data = df_model_in$`Shannon diversity`)
+anova(global3, global2) # n.s.
+AIC(global3, global2) # global2
+
+anova(global2, null) # sig
+AIC(global2, null) # global2
+
+summary(global2)
+```
+
+```{r, warning=FALSE}
+# plot most supported model
+ggplot(df_model_in$`Shannon diversity`, aes(x = area_50m, y = qD.minSC)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = LCL.minSC, ymax = UCL.minSC), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')+
+  # Plot the linear model (slope)
+  labs(
+    title = "GLOBAL"
+  ) +
+  theme_minimal()
+```
+
+### 6.6 Model by phylum
+
+```{r}
+# limit the model to relevant variables
+df_patch_phylum = df_patch
+
+# use shannon index
+qorder = 1
+
+```
+
+##### ARTHROPODA
+
+```{r, warning=FALSE}
+## ARTHROPODA
+df_div_ARTH =
+merge(
+  df_patch_phylum,
+  # min SC values
+  outARTH$iNextEst$coverage_based %>%
+    group_by(Assemblage,Order.q) %>% # Group by the condition column
+    mutate(differences = abs(SC - SCmin)) %>% # Calculate absolute difference
+    filter(differences == min(differences)) %>% # Filter rows with the smallest difference
+    filter(Order.q == qorder) %>% # Filter to use empirical species richness
+    ungroup(),  # Ungroup to return a regular data frame
+  by.x = "Site",by.y = "Assemblage"
+  )
+
+nullArth <- lm( qD ~ 1, 
+                    family = poisson ,
+                    data = df_div_ARTH)
+```
+
+```{r, warning=FALSE}
+## Tree cover
+lmArth_100m <- lm( qD ~ tree_100m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+lmArth_200m <- lm( qD ~ tree_200m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+lmArth_400m <- lm( qD ~ tree_400m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+anova(nullArth, lmArth_100m,lmArth_200m,lmArth_400m)
+AIC(nullArth, lmArth_100m,lmArth_200m,lmArth_400m) # Tree 100m
+```
+
+```{r, warning=FALSE}
+## woodcover
+lmArth_100m <- lm( qD ~ wood_100m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+lmArth_200m <- lm( qD ~ wood_200m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+lmArth_400m <- lm( qD ~ wood_400m ,
+            family = poisson ,  
+                    data = df_div_ARTH)
+anova(nullArth, lmArth_100m,lmArth_200m,lmArth_400m)
+AIC(nullArth, lmArth_100m,lmArth_200m,lmArth_400m) # wood_per_100m
+```
+
+```{r, warning=FALSE}
+# generate alternative model then compare
+glmArth <- lm( qD ~  area_50m + tree_100m  + wood_100m ,
+            family = poisson ,
+            data = df_div_ARTH)
+summary(glmArth)
+#checking model fit
+DHARMa::testDispersion(glmArth)
+DHARMa::simulateResiduals(glmArth, plot = TRUE)
+
+## simplify
+drop1(glmArth) # TREE
+glmArth2 <- lm( qD ~  area_50m  + wood_100m ,
+               family = poisson ,
+                    data = df_div_ARTH)
+anova(glmArth,glmArth2) # n.s.
+AIC(glmArth,glmArth2) # glmArth2	
+
+anova(nullArth,glmArth) # s.g.
+AIC(nullArth,glmArth) # glmArth	
+
+summary(glmArth)
+```
+
+```{r, warning=FALSE}
+# plot most supported model
+ggarrange(
+
+ggplot(df_div_ARTH, aes(x = area_50m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')+
+  theme_minimal(),
+
+ggplot(df_div_ARTH, aes(x = tree_100m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')+
+  theme_minimal(),
+
+ggplot(df_div_ARTH, aes(x = wood_100m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')+
+  theme_minimal(),
+
+nrow = 2, ncol = 2)
+
+```
+
+##### MOLLUSCA
+
+```{r, warning=FALSE}
+## MOLLUSCA
+df_div_MOLL =
+merge(
+  df_patch_phylum,
+  # min SC values
+  outMOLL$iNextEst$coverage_based %>%
+    group_by(Assemblage,Order.q) %>% # Group by the condition column
+    mutate(differences = abs(SC - SCmin)) %>% # Calculate absolute difference
+    filter(differences == min(differences)) %>% # Filter rows with the smallest difference
+    filter(Order.q == qorder) %>% # Filter to use empirical species richness
+    ungroup(),  # Ungroup to return a regular data frame
+  by.x = "Site",by.y = "Assemblage"
+  )
+
+nullMoll <- lm( qD ~ 1,
+               family = poisson ,
+                    data = df_div_MOLL)
+```
+
+```{r, warning=FALSE}
+## Tree cover
+lmMoll_100m <- lm( qD ~ tree_100m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+lmMoll_200m <- lm( qD ~ tree_200m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+lmMoll_400m <- lm( qD ~ tree_400m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+anova(nullMoll, lmMoll_100m,lmMoll_200m,lmMoll_400m)
+AIC(nullMoll, lmMoll_100m,lmMoll_200m,lmMoll_400m) # Tree 200m
+```
+
+```{r, warning=FALSE}
+## Wood cover
+lmMoll_100m <- lm( qD ~ wood_100m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+lmMoll_200m <- lm( qD ~ wood_200m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+lmMoll_400m <- lm( qD ~ wood_400m ,
+               family = poisson , 
+                    data = df_div_MOLL)
+anova(nullMoll, lmMoll_100m,lmMoll_200m,lmMoll_400m)
+AIC(nullMoll, lmMoll_100m,lmMoll_200m,lmMoll_400m) # wood 400m
+```
+
+```{r, warning=FALSE}
+glmMoll <- lm( qD ~ area_50m + tree_200m + wood_400m,
+                  family = poisson ,
+                    data = df_div_MOLL)
+summary(glmMoll)
+#checking model fit
+DHARMa::testDispersion(glmMoll)
+DHARMa::simulateResiduals(glmMoll, plot = TRUE)#good
+
+
+drop1(glmMoll) # TREE
+# generate alternative model then compare
+glmMoll2 <- lm( qD ~  area_50m + wood_400m,
+                  family = poisson ,
+                    data = df_div_MOLL)
+anova(glmMoll,glmMoll2) # ns.
+AIC(glmMoll,glmMoll2) # glmMoll2
+
+drop1(glmMoll2) # WOOD
+# generate alternative model then compare
+glmMoll3 <- lm( qD ~  area_50m ,
+                  family = poisson ,
+                    data = df_div_MOLL)
+anova(glmMoll3,glmMoll2) # ns.
+AIC(glmMoll3,glmMoll2) # glmMoll3
+
+anova(nullMoll,glmMoll3) # s.g.
+AIC(nullMoll,glmMoll3) # nullMoll
+
+summary(glmMoll3)
+```
+
+```{r, warning=FALSE}
+# plot most supported model
+ggplot(df_div_MOLL, aes(x = area_50m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')+
+  theme_minimal()
+```
+
+##### ANNELIDA
+
+```{r, warning=FALSE}
+## ANNELIDA
+df_div_ANNE =
+merge(
+  df_patch_phylum,
+  # min SC values
+  outANNE$iNextEst$coverage_based %>%
+    group_by(Assemblage,Order.q) %>% # Group by the condition column
+    mutate(differences = abs(SC - SCmin)) %>% # Calculate absolute difference
+    filter(differences == min(differences)) %>% # Filter rows with the smallest difference
+    filter(Order.q == qorder) %>% # Filter to use empirical species richness
+    ungroup(),  # Ungroup to return a regular data frame
+  by.x = "Site",by.y = "Assemblage"
+  )
+
+nullAnne <- lm( qD ~ 1,
+                family = poisson , 
+                    data = df_div_ANNE)
+```
+
+```{r, warning=FALSE}
+## Tree cover
+lmAnne_100m <- lm( qD ~ tree_100m ,
+                        family = poisson , 
+                    data = df_div_ANNE)
+lmAnne_200m <- lm( qD ~ tree_200m , 
+                        family = poisson , 
+                    data = df_div_ANNE)
+lmAnne_400m <- lm( qD ~ tree_400m ,
+                        family = poisson , 
+                    data = df_div_ANNE)
+anova(nullAnne, lmAnne_100m,lmAnne_200m,lmAnne_400m)
+AIC(nullAnne, lmAnne_100m,lmAnne_200m,lmAnne_400m) #  Tree 200m
+```
+
+```{r, warning=FALSE}
+## wood cover
+lmAnne_100m <- lm( qD ~ wood_100m , 
+                    family = poisson , 
+                    data = df_div_ANNE)
+lmAnne_200m <- lm( qD ~ wood_200m ,
+                    family = poisson , 
+                    data = df_div_ANNE)
+lmAnne_400m <- lm( qD ~ wood_400m ,
+                    family = poisson , 
+                    data = df_div_ANNE)
+anova(nullAnne, lmAnne_100m,lmAnne_200m,lmAnne_400m)
+AIC(nullAnne, lmAnne_100m,lmAnne_200m,lmAnne_400m) #  wood cover 100m
+```
+
+```{r, warning=FALSE}
+glmAnne <- lm( qD ~ area_50m + tree_200m + wood_100m,
+               family = poisson , 
+               data = df_div_ANNE)
+summary(glmAnne)
+#checking model fit
+DHARMa::testDispersion(glmAnne)
+DHARMa::simulateResiduals(glmAnne, plot = TRUE)#good
+
+drop1(glmAnne) # Tree_250m
+# generate alternative model then compare
+glmAnne2 <- MASS::glm.nb( qD ~ area_50m + wood_100m ,
+                    data = df_div_ANNE)
+anova(glmAnne,glmAnne2) # ns
+AIC(glmAnne,glmAnne2) # glmAnne
+
+anova(nullAnne,glmAnne) # n.s.g. 
+AIC(nullAnne,glmAnne) # glmAnne
+```
+
+```{r, warning=FALSE}
+# plot most supported model
+ggarrange(
+
+ggplot(df_div_ANNE, aes(x = area_50m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') +
+  theme_minimal(),
+
+ggplot(df_div_ANNE, aes(x = tree_100m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') +
+  theme_minimal(),
+
+ggplot(df_div_ANNE, aes(x = wood_100m, y = qD)) +
+  geom_smooth(method='lm', se = T, colour = "grey") +
+  geom_errorbar(aes(ymin = qD.LCL, ymax = qD.UCL), width = 0, color = "red") + # Add error bars
+  geom_point(size = 3, color = "black") + # Plot points
+  ggrepel::geom_label_repel(aes(label = Site),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') +
+  theme_minimal(),
+
+nrow = 2, ncol = 2)
+```
+
+## 7. Distance Matrix
+
+### 7.1 Frequency of occurence
+
+```{r}
+## prey frequency at sites using all pellets
+
+site_freq = list()
+# frequency table
+df_freq = incidence_raw[df_dim>=10]
+for (i in seq_along(df_freq)){
+  # frequency of occurrence
+  site_freq[[i]] = apply(df_freq[[i]], 1, mean)
+}
+
+# List prey names
+levels(as.factor(df.input$prey.id)) -> prey.name
+
+# Create an empty dataframe with the unique names as columns
+df_site_freq <- data.frame(matrix(NA, nrow = length(site_freq), ncol = length(prey.name)))
+colnames(df_site_freq) <- prey.name
+
+# Fill the dataframe with values from the lists
+for (i in seq_along(site_freq)) {
+  for (prey.name in names(site_freq[[i]])) {
+    df_site_freq[i, prey.name] <- site_freq[[i]][[prey.name]]
+  }
+}
+rownames(df_site_freq) = names(df_freq)
+```
+
+
+### 7.2 Distance matrix
+
+F statitsic not available when using site summary. Try running individuals and
+
+```{r}
+## generate distance matrix
+dist_freq = vegdist(df_site_freq, method="bray", na.rm = T)
+
+# Multivariate homogeneity of groups dispersion
+betadisper(dist_freq, rownames(df_site_freq), # Verify the group
+           type="median")->
+  bdisp_freq
+bdisp_freq
+# Test if one or more groups is more variable than the others, used to interpret the significance of F. 
+permutest(bdisp_freq, pairwise = TRUE,
+          permutations = 9999)
+```
+
+### 7.3 PCoA & PERMANOVA
+
+Use values taken from global model
+
+```{r}
+# add environmental conditions
+df_freq_env = data.frame(bdisp_freq$vectors)
+df_freq_env$site = labels(dist_freq)
+df_freq_env$area = df_patch[match(labels(dist_freq),df_patch$Site),"area_50m"]
+df_freq_env$tree_cover = df_patch[match(labels(dist_freq),df_patch$Site),"tree_100m"]
+df_freq_env$wood = df_patch[match(labels(dist_freq),df_patch$Site),"wood_100m"]
+df_freq_env$imperv = df_patch[match(labels(dist_freq),df_patch$Site),"imperv_100m"]
+```
+
+##### Area
+
+```{r}
+values <- df_freq_env$area
+## Scale your values to range between 0 and 1
+rr <- range(values)
+svals <- (values-rr[1])/diff(rr)
+## Play around with ends of the color range
+f <- colorRamp(c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026"))
+colors <- rgb(f(svals)/255)
+## Check that it works
+# append colour to glm.in file then join to presence data
+df_freq_env$color <- colors
+
+ggplot(data = df_freq_env, 
+       aes(x = PCoA1, y = PCoA2, 
+           fill = area, 
+           label=site,
+           size = 2
+           )) +
+  geom_point(color = df_freq_env$color) +
+  ggrepel::geom_text_repel(hjust=0, vjust=0, check_overlap = T) +
+  theme_classic() +
+  scale_shape_manual(values=rep(16,nrow(df_freq_env))) +
+  scale_fill_gradient2(midpoint = mean(range(df_freq_env$area)), 
+                       low = '#fed976' ,mid = '#fd8d3c', high = '#bd0026') +
+  labs(fill = "Area m2") +
+  scale_fill_gradientn(colours = c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026")) +
+  guides(size = FALSE,
+         fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 18)) -> fig.pcoa
+fig.pcoa
+
+permanova.sa =
+adonis2(dist_freq ~ df_patch[match(labels(dist_freq),df_patch$Site),"area_50m"], # Verify the group
+       method="bray", permutations=9999)
+```
+
+##### Imperviousness
+
+```{r}
+values <- df_freq_env$imperv
+## Scale your values to range between 0 and 1
+rr <- range(values)
+svals <- (values-rr[1])/diff(rr)
+## Play around with ends of the color range
+f <- colorRamp(c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026"))
+colors <- rgb(f(svals)/255)
+## Check that it works
+# append colour to glm.in file then join to presence data
+df_freq_env$color <- colors
+
+ggplot(data = df_freq_env, 
+       aes(x = PCoA1, y = PCoA2, 
+           fill = imperv, 
+           label=site,
+           size = 2
+           )) +
+  geom_point(color = df_freq_env$color) +
+  ggrepel::geom_text_repel(hjust=0, vjust=0, check_overlap = T) +
+  theme_classic() +
+  scale_shape_manual(values=rep(16,nrow(df_freq_env))) +
+  scale_fill_gradient2(midpoint = mean(range(df_freq_env$tree_cover)), 
+                       low = '#fed976' ,mid = '#fd8d3c', high = '#bd0026') +
+  labs(fill = "Imperviousness 100m") +
+  scale_fill_gradientn(colours = c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026")) +
+  guides(size = FALSE,
+         fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 18)) -> fig.pcoa
+fig.pcoa
+
+permanova.is =
+adonis2(dist_freq ~ df_patch[match(labels(dist_freq),df_patch$Site),"imperv_100m"], # Verify the group
+       method="bray", permutations=9999)
+
+```
+
+##### Tree Cover
+
+```{r}
+values <- df_freq_env$tree_cover
+## Scale your values to range between 0 and 1
+rr <- range(values)
+svals <- (values-rr[1])/diff(rr)
+## Play around with ends of the color range
+f <- colorRamp(c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026"))
+colors <- rgb(f(svals)/255)
+## Check that it works
+# append colour to glm.in file then join to presence data
+df_freq_env$color <- colors
+
+ggplot(data = df_freq_env, 
+       aes(x = PCoA1, y = PCoA2, 
+           fill = tree_cover, 
+           label=site,
+           size = 2
+           )) +
+  geom_point(color = df_freq_env$color) +
+  ggrepel::geom_text_repel(hjust=0, vjust=0, check_overlap = T) +
+  theme_classic() +
+  scale_shape_manual(values=rep(16,nrow(df_freq_env))) +
+  scale_fill_gradient2(midpoint = mean(range(df_freq_env$tree_cover)), 
+                       low = '#fed976' ,mid = '#fd8d3c', high = '#bd0026') +
+  labs(fill = "Tree Cover 100m") +
+  scale_fill_gradientn(colours = c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026")) +
+  guides(size = FALSE,
+         fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 18)) -> fig.pcoa
+fig.pcoa
+
+permanova.tc =
+adonis2(dist_freq ~ df_patch[match(labels(dist_freq),df_patch$Site),"tree_100m"], # Verify the group
+       method="bray", permutations=9999)
+
+```
+
+##### Wood Features
+
+```{r}
+values <- df_freq_env$wood
+## Scale your values to range between 0 and 1
+rr <- range(values)
+svals <- (values-rr[1])/diff(rr)
+## Play around with ends of the color range
+f <- colorRamp(c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026"))
+colors <- rgb(f(svals)/255)
+## Check that it works
+# append colour to glm.in file then join to presence data
+df_freq_env$color <- colors
+
+ggplot(data = df_freq_env, 
+       aes(x = PCoA1, y = PCoA2, 
+           fill = wood, 
+           label=site,
+           size = 2
+           )) +
+  geom_point(color = df_freq_env$color) +
+  ggrepel::geom_text_repel(hjust=0, vjust=0, check_overlap = T) +
+  theme_classic() +
+  scale_shape_manual(values=rep(16,nrow(df_freq_env))) +
+  scale_fill_gradient2(midpoint = mean(range(df_freq_env$wood)), 
+                       low = '#fed976' ,mid = '#fd8d3c', high = '#bd0026') +
+  labs(fill = "Wood Cover 100m") +
+  scale_fill_gradientn(colours = c("#fed976","#feb24c","#fd8d3c","#f03b20","#bd0026")) +
+  guides(size = FALSE,
+         fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 18)) -> fig.pcoa
+fig.pcoa
+
+permanova.wf =
+adonis2(dist_freq ~ df_patch[match(labels(dist_freq),df_patch$Site),"wood_100m"], # Verify the group
+       method="bray", permutations=9999)
+
+```
+
+
+```{r}
+permova_results =
+rbind.data.frame(as.data.frame(permanova.sa[1,]),as.data.frame(permanova.is[1,]),
+                 as.data.frame(permanova.tc[1,]),as.data.frame(permanova.wf[1,])
+                 )
+rownames(permova_results) = c("SA","IS","TC","WF")
+saveRDS(permova_results,
+        paste0(dir_int,"permanova_results.Rds"))
+```
+
+## 8. Mantel Tests
+
+```{r}
+ get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+```
+
+
+#### 8.1 Frequency occurnce threshold
+
+```{r}
+### Limit analysis to prey occuring in >= 5% of pellets
+# number of pellets considered
+n_pell =
+  length(unique(
+  df.input[df.input$site %in% rownames(df_site_freq), # use only sites in analysis
+           "sample"]))
+
+# occurrence of each prey taxa
+per_prey_occur = 
+sort(table(unique.data.frame(
+  df.input[df.input$site %in% rownames(df_site_freq), # use only sites in analysis
+           c("sample","prey.id")])$prey.id),
+  decreasing = T # from most to least
+  ) / n_pell # occurence in what proportion of pellets
+
+# names of common prey
+perprey = names(per_prey_occur[per_prey_occur > 0.05])
+
+# new prey pairwise distance for only most common prey
+dist_prey = vegdist(df_site_freq[,perprey], method="bray", na.rm = T)
+
+dist_m = as.matrix(dist_prey)
+dist_m = reshape2::melt(
+  get_upper_tri(dist_m),  na.rm = TRUE
+  )
+
+## Visulize as heatmap
+  ggplot(
+    dist_m, 
+    aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(show.legend=F) + #heat mape style, legend turned off
+    coord_fixed() +
+    geom_text(aes(label = round(value, digits = 2)))+ #print rounded values in cells
+    labs(x = NULL, y = NULL, title = "Overall")+ #adjust legends
+    scale_fill_gradient(low = "white", high = "#dc6a2b") +
+    theme(axis.text.x = element_text(angle = 45))
+  
+ggsave(paste0(dir_int,"SM_prey_distance.png"), device = "png")  
+```
+### 8.2 Distance in Prey Freq. by Phylum
+
+```{r}
+phylum = unique(df.input$Phylum)
+
+taxa = list()
+dist_phylum = list()
+visual_dist = list()
+for (i in seq_along(phylum)){
+  taxa[[i]] = colnames(df_site_freq)[colnames(df_site_freq) %in% df.input[df.input$Phylum==phylum[i],"prey.id"]]
+# distance for each prey phylum 
+  dist_phylum[[i]] = vegdist(df_site_freq[,taxa[[i]]], method="bray", na.rm = T)
+  
+  dist_m <- as.matrix(dist_phylum[[i]])
+  rownames(dist_m) = rownames(df_site_freq)
+  colnames(dist_m) = rownames(df_site_freq)
+  dist_m = reshape2::melt(
+    get_upper_tri(dist_m),  na.rm = TRUE)
+  ## Visulize as heatmap
+  visual_dist[[i]] =
+    ggplot(dist_m, 
+           aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(show.legend=F) + #heat map style, legend turned off
+  geom_text(aes(label = round(value, digits = 3)))+ #print rounded values in cells
+  labs(x = NULL, y = NULL, title = paste(phylum[i]))+ #adjust legends
+  scale_fill_gradient(low = "white", high = "#dc6a2b") +
+  theme(axis.text.x = element_text(angle = 45))
+}
+ggarrange(plotlist=visual_dist, ncol = 3, nrow = 1)
+ggsave(paste0(dir_int,"SM_phylum_distance.png"),
+       ggarrange(plotlist=visual_dist, ncol = 3, nrow = 1),
+       device = "png",height = 8,width = 26,units = "cm")
+
+```
+
+### 8.3 Environment distance matrix
+
+Establish the distance matrices for each environmental variable, then use a Mantel test to see how they relate to prey variance between sites.
+
+```{r, warning=FALSE}
+### Limit comparison to environmental variables of interest
+in_pca_env = df_patch[df_patch$Site %in% labels(dist_freq),
+                  #(colnames(df_patch) %in% c("Site", "area_50m","imperv_100m","tree_100m","wood_100m"))
+                  ]
+
+in_pca_env = in_pca_env[match(rownames(df_site_freq),in_pca_env$Site),]
+in_pca_site = in_pca_env[,1]
+in_pca_env = in_pca_env[,-1]
+
+visual_dist = list()
+
+# for each environmental variable of interest generate a distance matrix
+dist_env_i = list()
+for (i in 1:ncol(in_pca_env)){
+  dist_env_i[[i]] = vegdist(in_pca_env[,i], method="bray", na.rm = T)
+  dist_m <- as.matrix(dist_env_i[[i]])
+  rownames(dist_m) = in_pca_site
+  colnames(dist_m) = in_pca_site
+  dist_m = reshape2::melt(get_upper_tri(dist_m),  na.rm = TRUE)
+  ## Visulize as heatmap
+  visual_dist[[i]] =
+    ggplot(dist_m, 
+           aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(show.legend=F) + #heat mape style, legend turned off
+  geom_text(aes(label = round(value, digits = 3)))+ #print rounded values in cells
+  labs(x = NULL, y = NULL, title = colnames(in_pca_env)[i])+ #adjust legends
+  scale_fill_gradient(low = "white", high = "#dc6a2b") +
+  theme(axis.text.x = element_text(angle = 45))
+  ## Visualize as network
+  #visual_dist[[i]] = qgraph::qgraph(dist_m, layout='circle', vsize=6, theme = "gray", 
+  #                                  minimum = 0, maximum = 1)
+}
+names(dist_env_i) = colnames(in_pca_env)
+
+ggarrange(plotlist=visual_dist[-1], ncol = 3, nrow = 3)
+
+ggsave(paste0(dir_int,"SM_env_distance.png"),
+       ggarrange(plotlist=visual_dist[-1], ncol = 3, nrow = 3),
+       device = "png",height = 24,width = 26,units = "cm")
+
+
+```
+
+
+
+### 8.4 Environment X Phylum
+
+```{r, warning=FALSE}
+
+df_mantel_all = data.frame(env = character(),prey = character(),R = numeric(),P = numeric())
+r = 0
+# run mantel test comparing distance matrix based on frequency to environmental variables
+for (i in seq_along(dist_env_i)){
+  r = r+1
+  tmp = mantel(dist_env_i[[i]], dist_freq, method = "pearson", permutations = 999,na.rm = T)
+  df_mantel_all = rbind.data.frame(df_mantel_all,
+                                   c(names(dist_env_i)[i],"all",signif(tmp$statistic,2),signif(tmp$signif,2)))
+  for (p in seq_along(phylum)){
+    r = r+1
+    tmp = mantel(dist_env_i[[i]], dist_phylum[[p]], method = "pearson", permutations = 999,na.rm = T)
+    df_mantel_all = rbind.data.frame(df_mantel_all,
+                                   c(names(dist_env_i)[i],phylum[p],signif(tmp$statistic,2),signif(tmp$signif,2)))
+}}
+colnames(df_mantel_all) = c("env","prey","R","P")
+df_mantel_all
+write.csv(df_mantel_all,paste0(dir_int,"df_mantel_env_prey.csv"))
+```
+
+```{r}
+bfp = 0.05/nrow(df_mantel_all) # Bonferoni value
+
+
+ggplot(
+  df_mantel_all %>%
+         mutate_at(c('R', 'P'), as.numeric) %>%
+         mutate(sig = case_when(
+           P < bfp ~ "*",
+           P >= bfp ~ "")) %>%
+     mutate(across('env', str_replace, 'wood', 'WF')) %>%
+     mutate(across('env', str_replace, 'tree', 'TC')) %>%
+     mutate(across('env', str_replace, 'imperv', 'IS')) %>%
+     mutate(across('prey', str_replace, 'all', 'all prey')), 
+       aes(prey, env, fill = R, label = sig)) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_gradientn(colours=c("#0c71a9","white","#dc6a2b"), na.value = "grey98", 
+                       limits = c(-1, 1)) +
+  xlab("prey phylum") + ylab("habitat variable") + labs(fill='R2') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) ->
+  p.mantel.env_prey
+p.mantel.env_prey
+ggsave(paste0(dir_int,"SM_mantel_env_prey_results.png"),
+       p.mantel.env_prey,width = 100,height = 120,units = "mm")
+```
+
+
+Comparing the distance matrices for environmental variables to that of prey frequency of occurrence, only tree cover between 250m was significantly correlated. For each variable the 250m buffer had the strongest correlation, with the exception for woody features within 100m.
+
+```{r}
+## PCA
+in_pca_env = df_patch[df_patch$Site %in% labels(dist_freq),
+                  c("Site","imperv_100m","tree_100m","wood_100m")]
+
+in_pca_env = in_pca_env[match(labels(dist_freq),in_pca_env$Site),]
+
+prcomp(
+  in_pca_env[,-1]
+  ) -> pca_env
+
+summary(pca_env)
+
+
+## generate distance matrix
+dist_env = vegdist(in_pca_env[,-1], method="bray", na.rm = T)
+# Multivariate homogeneity of groups dispersion
+betadisper(dist_env, df_patch$Site[df_patch$Site %in% df_freq_env$site], # Verify the group
+           type="median")->
+  bdisp_env
+bdisp_env
+# Test if one or more groups is more variable than the others, used to interpret the significance of F. 
+permutest(bdisp_env, pairwise = TRUE,
+          permutations = 9999)
+
+mantel(dist_env, dist_freq, method = "pearson", permutations = 999,na.rm = T)
+
+for (p in seq_along(phylum)){
+  tmp = mantel(dist_freq, dist_phylum[[p]], method = "pearson", permutations = 999,na.rm = T)
+  print(paste("Combined Env.","x",phylum[p],
+              "= R",signif(tmp$statistic,2),
+              ", p",signif(tmp$signif,2)))
+}
+
+```
+
+```{r}
+dist_env
+dist_freq
+
+mantel_result <- mantel(dist_env, dist_freq, method = "pearson", permutations = 999)
+mantel_result
+```
+
+```{r}
+# limit to geo-position
+df_latlon = unique.data.frame(df.input[,c("site","lat","lon")])
+# limit to analysed sites
+df_latlon = df_latlon[df_latlon$site %in% labels(dist_freq),]
+# remove duplicate sites
+df_latlon =  df_latlon[!duplicated(df_latlon$site),]
+# match order of diet
+df_latlon =  df_latlon[match(df_latlon$site,in_pca_env$Site),]
+
+# distance matrix
+dist_latlon = vegdist(df_latlon[,-1], method="euclidean", na.rm = T)
+
+mantel(dist_freq, dist_latlon, method = "pearson", permutations = 999,na.rm = T)
+```
+
+No significant correlation between pairwise geographic distance and prey frequency of occurence.
+
+### 8.5 Headshape Distance Matrices
+
+```{r}
+morph_site_names = c("P.Avioso","P.Cidade","Matosinhos","Mindelo","P.Oriental","Ramalde")
+
+head_dist_freq = vegdist(df_site_freq[match(morph_site_names,rownames(df_site_freq)),], method="bray", na.rm = T)
+
+# Allometric slopes attributes pairwise differences
+matrix_head_mean =
+  read.csv("shape_matrices/LSdist-sizevar.csv")
+
+matrix_head_dist = 
+  read.csv("shape_matrices/slope-dist-pairwise.csv")
+  
+matrix_head_leng = 
+  read.csv("shape_matrices/slope-DL-pairwise.csv")
+
+matrix_head_angl = 
+  read.csv("shape_matrices/slope-VC-pairwise.csv")
+
+dist_morph = list(matrix_head_mean,matrix_head_dist,matrix_head_leng,matrix_head_angl)
+morph_measure = c("mean","distance","length","angle")
+```
+
+```{r}
+visual_dist = list()
+for (i in seq_along(dist_morph)){
+  dist_m <- as.matrix(dist_morph[[i]][,-1])
+  rownames(dist_m) = morph_site_names
+  colnames(dist_m) = morph_site_names
+  dist_m = reshape2::melt(get_upper_tri(dist_m),  na.rm = TRUE)
+  ## Visulize as heatmap
+  visual_dist[[i]] =
+    ggplot(dist_m, aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(show.legend=F) + #heat mape style, legend turned off
+  geom_text(aes(label = round(value, digits = 3)))+ #print rounded values in cells
+  labs(x = NULL, y = NULL, title = paste("measure:",morph_measure[i]))+ #adjust legends
+  scale_fill_gradientn(colours=c("#0c71a9","white","#dc6a2b"), na.value = "grey98", 
+                       limits = c(-max(dist_m$value), max(dist_m$value))) +
+  theme(axis.text.x = element_text(angle = 45))
+}
+
+dist_morph[[i]]
+
+ggarrange(plotlist=visual_dist, ncol = 2, nrow = 2)
+
+ggsave(paste0(dir_int,"SM_headshape_distance.png"),
+       ggarrange(plotlist=visual_dist, ncol = 2, nrow = 2),
+       device = "png",height = 16,width = 20,units = "cm")
+```
+
+
+### 8.6 Headshape X Environment
+
+```{r}
+df_mantel_morph = data.frame(env = character(),prey = character(),R = numeric(),P = numeric())
+r = 0
+# run mantel test comparing distance matrix based on frequency to environmental variables
+for (i in seq_along(dist_env_i)){
+  for (d in seq_along(dist_morph)){
+  r = r+1
+  tmp = mantel(dist_env_i[[i]], dist_morph[[d]], method = "pearson", permutations = 999,na.rm = T)
+  df_mantel_morph = rbind.data.frame(df_mantel_morph,
+                                   c(names(dist_env_i)[i],morph_measure[d],signif(tmp$statistic,2),signif(tmp$signif,2)))
+  }}
+colnames(df_mantel_morph) = c("env","morph","R","P")
+df_mantel_morph
+
+bfp = 0.05/nrow(df_mantel_morph)
+
+ggplot(
+  df_mantel_morph %>%
+         mutate_at(c('R', 'P'), as.numeric) %>%
+         mutate(sig = case_when(
+           P < bfp ~ "*",
+           P >= bfp ~ "")) %>%
+     mutate(across('env', str_replace, 'wood', 'WF')) %>%
+     mutate(across('env', str_replace, 'tree', 'TC')) %>%
+     mutate(across('env', str_replace, 'imperv', 'IS')), 
+       aes(morph, env, fill = R, label = sig)) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_gradientn(colours=c("#0c71a9","white","#dc6a2b"), na.value = "grey98", 
+                       limits = c(-1, 1)) +
+  xlab("head measure") + ylab("habitat variable") + labs(fill='R2') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) ->
+  p.mantel.env_morph
+p.mantel.env_morph
+
+```
+
+```{r}
+df_mantel_preyhead = data.frame(env = character(),prey = character(),R = numeric(),P = numeric())
+r = 0
+for (d in seq_along(dist_morph)){
+  r = r+1
+  tmp = mantel(dist_freq, dist_morph[[d]], method = "pearson", permutations = 999,na.rm = T)
+  df_mantel_preyhead = rbind.data.frame(df_mantel_preyhead,
+                                   c("all prey",morph_measure[d],signif(tmp$statistic,2),signif(tmp$signif,2)))
+  for (p in seq_along(dist_phylum)){
+    r = r+1
+    tmp = mantel(dist_phylum[[p]], dist_morph[[d]], method = "pearson", permutations = 999,na.rm = T)
+    df_mantel_preyhead = rbind.data.frame(df_mantel_preyhead,
+                                   c(phylum[p],morph_measure[d],signif(tmp$statistic,2),signif(tmp$signif,2)))
+    
+}}
+colnames(df_mantel_preyhead) = c("prey","morph","R","P")
+df_mantel_preyhead
+
+bfp = 0.05/nrow(df_mantel_preyhead)
+
+ggplot(
+  df_mantel_preyhead %>%
+         mutate_at(c('R', 'P'), as.numeric) %>%
+         mutate(sig = case_when(
+           P < bfp ~ "*",
+           P >= bfp ~ "")), 
+       aes(prey, morph, fill = R, label = sig)) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_gradientn(colours=c("#0c71a9","white","#dc6a2b"), na.value = "grey98", 
+                       limits = c(-1, 1)) +
+  xlab("prey phylum") + ylab("head measure") + labs(fill='R2') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        C) ->
+  p.mantel.prey_morph
+p.mantel.prey_morph
+
+```
+
+
+```{r}
+ggarrange(
+  p.mantel.env_prey, p.mantel.env_morph, p.mantel.prey_morph, 
+  ncol = 3, nrow = 1, common.legend = TRUE, legend="right"
+)
+
+ggsave(paste0(dir_int,"SM_mantel_plots.png"),last_plot())
+
+```
+### 8.7 Phenotype variation by environment
+
+```{r}
+morph_site_names
+  pheno_var = c(0.00106404,0.00088206,0.00116537,0.00112127,0.00117536,0.00133499)
+  pheno_var = read.csv("shape_matrices/PV-pop-sizevar.CSV",row.names = NULL)
+  
+df_phenoV = cbind.data.frame(morph_site_names, pheno_var)
+colnames(pheno_var) = c('Site','phenoV')
+
+df_pv_comparions = 
+  df_model_in$`Shannon diversity` %>%
+  select(-one_of("Order.q","SE.Asy","LCL.Asy","UCL.Asy","minSC","mint","maxt","Method.y","qD.Asy",
+                 "LCL.minSC","UCL.minSC","Method.x","qD.maxSC","LCL.maxSC","UCL.maxSC","maxSC")) %>%
+  mutate(qD.ARTH = df_div_ARTH$qD,
+         qD.ANNE = df_div_ANNE$qD,
+         qD.MOLL = df_div_MOLL$qD
+         ) %>%
+   arrange(match(Site, pheno_var$Site)) %>%
+  rename(Site=Site,
+         Search_Area=area_50m ,
+         IS_100m=imperv_100m,
+         IS_200m=imperv_200m ,
+         IS_400m=imperv_400m ,
+         TC_100m=tree_100m ,
+         TC_200m=tree_200m ,
+         TC_400m=tree_400m ,
+         WF_100m=wood_100m ,
+         WF_200m=wood_200m ,
+         WF_400m=wood_400m ,
+         Richness=Observed ,
+         qD.Total=qD.minSC ,
+         qD.ARTH=qD.ARTH ,
+         qD.ANNE=qD.ANNE ,
+         qD.MOLL=qD.MOLL 
+         )
+
+matrix_phenoV =
+  Hmisc::rcorr(
+    as.matrix(merge.data.frame(
+      pheno_var,
+      df_pv_comparions)[,-1]), 
+    type = "pearson")
+
+
+coef_phenoV = matrix_phenoV$r[colnames(pheno_var)[-1],
+                              colnames(df_pv_comparions)[-1]]
+sig_phenoV = matrix_phenoV$P[colnames(pheno_var)[-1],
+                              colnames(df_pv_comparions)[-1]]
+
+df_temp = cbind.data.frame(coef_phenoV,sig_phenoV)
+df_temp$env <- factor(rownames(df_temp), levels = rownames(df_temp))
+df_temp$p_category <- cut(df_temp$sig_phenoV,
+                     breaks = c(0, 0.001, 0.01, 0.05, Inf),
+                     labels = c("p < 0.001", "p < 0.01", "p < 0.05", "NS"),
+                     include.lowest = TRUE)
+
+
+ggplot(df_temp, aes(x = env, y = coef_phenoV, fill = p_category)) +
+  geom_col(stat = "identity", position = "identity", width = 0.5, color = "black") +
+  scale_fill_manual(values = c("p < 0.001" = "red3", 
+                               "p < 0.01" = "orange", 
+                               "p < 0.05" = "yellow", 
+                               "NS" = "grey"))  +
+  labs(x = "Value", 
+       y = "R2 Coefficient (absolute value)",
+       color = "P-value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(paste0(dir_int,'pv_corrplot.png'), width = 12, height = 6, units = "cm")
+```
+
+```{r}
+df_phenoV.env = 
+  merge.data.frame(
+    df_phenoV, 
+    df_patch[,c(1,grep("tree",colnames(df_patch)))])
+
+write_rds(
+  df_phenoV.env[,1:2],
+  paste0(dir_int,"SM_pheno_variation_site.Rds")  
+  )
+
+ggplot(reshape2::melt(df_phenoV.env[,-1] ,  id.vars = 'phenoV', variable.name = 'series'), 
+       aes(phenoV, value)) +
+  geom_point(aes(colour = series)) +
+   theme_minimal()
+
+```
+
+## 9. PCA
+
+Display PCA for environment
+
+```{r}
+in_pca = df_site_freq # prey frequency table 
+in_pca[is.na(in_pca)] = 0 # set NA as 0 for PCA
+
+## PCA
+prcomp(
+  in_pca
+  ) -> pca_freq
+
+summary(pca_freq)
+plot(pca_freq)
+```
+
+```{r}
+# format for figure
+in_pca$Site = rownames(in_pca)
+df_pca_in = merge(
+  in_pca,
+  df_patch[match(labels(dist_freq),df_patch$Site),c("Site","imperv_100m")],
+  "Site"
+  )
+
+# Project PCA
+autoplot(pca_freq,
+         data=df_pca_in,
+         size = 4,
+         label = TRUE, label.label = "Site", label.vjust = 2,label.size=3,label.colour = "black",
+         colour =  "imperv_100m",
+         fill = "imperv_100m",
+         loadings = TRUE,
+         loadings.label=TRUE,
+         loadings.colour = "black",
+         loadings.label.colour="black",
+         loadings.label.repel=TRUE)  +
+  theme_classic() +
+  scale_colour_gradientn(colours = c('#fed976','#fd8d3c','#bd0026')) +
+  scale_shape_manual(values=rep(16,nrow(df_pca_in))) +
+  scale_fill_gradient2(midpoint = mean(range(df_freq_env$wood)), 
+                       low = '#fed976' ,mid = '#fd8d3c', high = '#bd0026') +
+  labs(fill = "imperv_100m") +
+  guides(size = FALSE,
+         color = FALSE,
+         fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 18)) -> fig.pca
+fig.pca
+```
+
+## 10. Frequency of Occurnece
+
+<https://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/113-ca-correspondence-analysis-in-r-essentials/>
+
+### 10.1 filter prey frequency 10%
+
+```{r}
+df_ca = df_site_freq
+# is similar to PCoA but cannot handle NA, convert NA to 0
+df_ca[is.na(df_ca)] <- 0
+# additionally, will not work well with very low values, so requires integers
+df_ca = df_ca * 100
+# number of pellets considered
+n_pell =
+  length(unique(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           "sample"]))
+
+# occurrence of each prey taxa
+per_prey_occur = 
+sort(table(unique.data.frame(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           c("sample","prey.id")])$prey.id),
+  decreasing = T # from most to least
+  ) / n_pell # occurrence in what proportion of pellets
+
+# names of common prey
+perprey = names(per_prey_occur[per_prey_occur > 0.1])
+if (BOLDIGG.I==TRUE){
+perprey = names(per_prey_occur[per_prey_occur > 0.1])
+  }
+
+df_ca = df_ca[,c(perprey)]
+
+perprey
+
+df_prey = unique.data.frame(df.input[,c("Phylum","prey.id")])
+perprey_phylum = df_prey[df_prey$prey.id %in% perprey,c("Phylum")]
+
+## define as matrix
+matrix_ca = prop.table(as.matrix(df_ca), margin = 1)
+## pivot longer for display
+df_ca_long = pivot_longer(cbind.data.frame(rownames(matrix_ca),matrix_ca),cols = colnames(matrix_ca))
+colnames(df_ca_long) = c("Site","Prey","Freq")
+df_ca_long$Phylum = df_prey$Phylum[match(df_ca_long$Prey,df_prey$prey.id)]
+
+df_ca_long$Site = factor(df_ca_long$Site, levels = c("P.Avioso","Mindelo",
+                                                     "P.Cidade","P.Oriental",
+                                                     "Ramalde","Matosinhos"))
+
+## plot differences in most common prey
+ggplot(df_ca_long, aes(x = Site, y = Freq, fill = Phylum)) +
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  scale_fill_manual(values = c("#66c2a5","#fc8d62","#8da0cb")) +
+  #facet_wrap(~ Prey) +
+  labs(title = element_blank(),
+       x = element_blank(),
+       y = "Frequency of occurence",
+       fill = "Subcategory") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  #guides(fill="none") +
+  theme_classic() -> fig_preyfreq
+
+fig_preyfreq
+
+ggsave(paste0(dir_int,"SM_phylum_relative_frequency.png"))
+
+# test for correlation between Lumbricus and Armadillidium
+cor.test(matrix_ca[,1],matrix_ca[,2])
+```
+
+```{r}
+prey = unique(df_ca_long$Prey)
+img =  prey_img[prey_img$taxa %in% prey,"url"]
+
+img_plot_iso =
+  ggplot() + 
+  ggimage::geom_image(aes(x = 0, y = 0, image = img[1]), size = 1) + 
+  theme_void()
+img_plot_ann =
+  ggplot() + 
+  ggimage::geom_image(aes(x = 0, y = 0, image = img[2]), size = 1) + 
+  theme_void()
+
+```
+
+```{r}
+df_ca_long_IS = df_ca_long
+df_ca_long_IS$IS = df_patch[match(df_ca_long_IS$Site,df_patch$Site),]$imperv_400m
+df_ca_long_IS$TC = df_patch[match(df_ca_long_IS$Site,df_patch$Site),]$tree_200m
+
+p1 =
+ggplot(df_ca_long_IS[df_ca_long_IS$Prey == unique(df_ca_long_IS$Prey)[1],], 
+       aes(x = Site, y = Freq, fill = IS, ymin = 0, ymax = 1)) +
+  ylim(0,1) + 
+  facet_wrap(~ Prey) +
+  geom_bar(stat = "identity", position = "stack", color = "black",ymin = 0, ymax = 1) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#636363") +
+  #scale_fill_manual(values = c("#636363")) +
+  guides(fill="none") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+  patchwork::inset_element(img_plot_iso, 
+                left = -0.9, 
+                bottom = 0.7, 
+                right = 0.98, 
+                top = 0.99)
+p2 =
+ggplot(df_ca_long_IS[df_ca_long_IS$Prey == unique(df_ca_long_IS$Prey)[3],], 
+       aes(x = Site, y = Freq, fill = IS, ymin = 0, ymax = 1)) +
+  ylim(0,1) + 
+  facet_wrap(~ Prey) +
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  scale_fill_gradient(low = "#f7f7f7", high = "#636363") +
+  #scale_fill_manual(values = c("#636363")) +
+  guides(fill="none") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+  patchwork::inset_element(img_plot_iso, 
+                left = -0.9, 
+                bottom = 0.7, 
+                right = 0.98, 
+                top = 0.99)
+p3 =
+ggplot(df_ca_long_IS[df_ca_long_IS$Prey == unique(df_ca_long_IS$Prey)[2],], 
+       aes(x = Site, y = Freq, fill = IS, ymin = 0, ymax = 1)) +
+  ylim(0,1) + 
+  facet_wrap(~ Prey) +
+  geom_bar(stat = "identity", position = "stack", color = "black",ymin = 0, ymax = 1) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#636363") +
+  #scale_fill_manual(values = c("#636363")) +
+  guides(fill="none") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  theme(panel.background = element_blank(),
+        axis.title.x=element_blank()) +
+  patchwork::inset_element(img_plot_ann, 
+                left = -0.9, 
+                bottom = 0.7, 
+                right = 0.98, 
+                top = 0.99)
+
+fig_preyfreq = 
+  ggarrange(p1, p2, p3, ncol = 1, nrow = 3, heights = c(1,1,1.5), 
+            common.legend = TRUE, legend="right")
+fig_preyfreq
+```
+
+### 10.2 Filter prey frequency 5%
+
+```{r}
+df_ca = df_site_freq
+# is similar to PCoA but cannot handle NA, convert NA to 0
+df_ca[is.na(df_ca)] <- 0
+# additionally, will not work well with very low values, so requires integers
+df_ca = df_ca * 100
+# number of pellets considered
+n_pell =
+  length(unique(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           "sample"]))
+
+# occurrence of each prey taxa
+per_prey_occur = 
+sort(table(unique.data.frame(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           c("sample","prey.id")])$prey.id),
+  decreasing = T # from most to least
+  ) / n_pell # occurence in what proportion of pellets
+
+# names of common prey
+perprey = names(per_prey_occur[per_prey_occur > 0.05])
+if (BOLDIGG.I==TRUE) {
+  perprey = names(per_prey_occur[per_prey_occur > 0.05])
+}
+
+
+df_ca = df_ca[,c(perprey)]
+```
+
+To interpret correspondence analysis, the first step is to evaluate whether there is a significant dependency between the rows and columns.
+
+## 11. Correspondence Analysis
+
+A rigorous method is to use the chi-square statistic for examining the association between row and column variables. This appears at the top of the report generated by the function summary(res.ca) orprint(res.ca), see section @ref(r-code-to-compute-ca). A high chi-square statistic means strong link between row and column variables.
+
+```{r}
+res.ca <- CA(df_ca, graph = FALSE)
+
+# Chi-square statistics
+chi2 <- 1944.456
+# Degree of freedom
+df <- (nrow(df_ca) - 1) * (ncol(df_ca) - 1)
+# P-value
+pval <- pchisq(chi2, df = df, lower.tail = FALSE)
+pval
+```
+
+Significant dependency between site and prey taxa
+
+### 11.1 Correlation Prey Frequency & Environment
+
+```{r}
+# build correlation matrix
+corr_matrix =
+  Hmisc::rcorr(
+    as.matrix(merge.data.frame(df_ca, 
+                 df_patch %>% remove_rownames() %>% column_to_rownames(var="Site"),  
+                 by = 0)[,-1]), 
+    type = "pearson")
+
+cor_coef = corr_matrix$r[colnames(df_ca),colnames(df_patch %>% remove_rownames() %>% column_to_rownames(var="Site"))]
+cor_sig = corr_matrix$P[colnames(df_ca),colnames(df_patch %>% remove_rownames() %>% column_to_rownames(var="Site"))]
+
+colnames(cor_coef) = c("SA",
+                       "IS_100m","IS_200m","IS_400m",
+                       "TC_100m","TC_200m","TC_400m",
+                       "WF_100m","WF_200m","WF_400m")
+
+png(paste0(dir_int,"env_prey_rcorr.png"))
+p_prey_env =
+corrplot(cor_coef, 
+         method = "circle",         # Visualization method
+         type = "full",            # Show full matrix
+         p.mat = cor_sig,      # Matrix of p-values
+         sig.level = c(0.05), # Significance levels
+         insig = "label_sig",      # Label significant correlations
+         pch.col = "white",
+         pch.cex = 2,           # Size of significance markers
+         tl.col = "black",         # Text label color
+         tl.srt = 45,              # Text label rotation
+         #addCoef.col = "black",    # Color of correlation coefficients
+         number.cex = 0.7,         # Size of correlation coefficients
+         mar = c(0, 0, 1, 0),      # Margins around the plot
+         title = "Correlation between PREY and ENVIRONMENT")
+dev.off()
+```
+
+### 11.2 Eigenvalues / Variances
+
+Recall that, we examine the eigenvalues to determine the number of axis to be considered. The eigenvalues and the proportion of variances retained by the different axes can be extracted using the function get_eigenvalue() [factoextra package]. Eigenvalues are large for the first axis and small for the subsequent axis.
+
+```{r}
+
+eig.val <- get_eigenvalue(res.ca)
+eig.val
+
+fviz_screeplot(res.ca, addlabels = TRUE, ylim = c(0, 50)) +
+  geom_hline(yintercept=1/(nrow(df_ca)-1) * 100,  # If the data were random, the expected value of the eigenvalue for each axis 
+             linetype=2, color="red")
+
+```
+
+### 11.3 Graph of prey variables
+
+```{r}
+col <- get_ca_col(res.ca)
+
+# repel= TRUE to avoid text overlapping (slow if many point)
+fviz_ca_biplot(res.ca, col.col = "contrib", col.row = "black",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE, title = "") +
+  labs(color = "Prey Contribution", shape = "Prey Contribution")
+
+
+# Color by cos2 values: quality on the factor map
+fviz_ca_col(res.ca, col.col = "cos2", col.row = "black",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE, title = "") 
+```
+
+```{r}
+corrplot(col$cos2[order(-col$cos2[,1],-col$cos2[,2]), ], # sort and limit to the most informative prey 
+           is.corr=FALSE)
+
+corrplot(col$cos2[order(rowSums(col$cos2[,1:2]),decreasing = T), ], # sort and limit to the most informative prey 
+           is.corr=FALSE)
+
+# Cos2 of rows on Dim.1 and Dim.2
+fviz_cos2(res.ca, choice = "col", axes = 1:2) +
+  geom_hline(yintercept=1/(ncol(df_ca)-1) * 100,  # If the data were random, the expected value of the eigenvalue for each axis 
+             linetype=2, color="red")
+
+# Contributions of rows to dimension 1
+fviz_contrib(res.ca, choice = "col", axes = 1, top = 10)
+# Contributions of rows to dimension 2
+fviz_contrib(res.ca, choice = "col", axes = 2, top = 10)
+
+# Total contribution to dimension 1 and 2
+fviz_contrib(res.ca, choice = "col", axes = 1:2, top = 10)
+```
+
+## 12. Canonical Correspondence Analysis (CCA)
+
+Test for relationship between diet frequency of occurrence matrix and environmental variable matrix.
+
+```{r}
+df_ca
+
+df_env = df_patch[df_patch$Site %in% rownames(df_site_freq),]
+rownames(df_env) = df_env$Site
+df_env =  df_env[match(rownames(df_site_freq),rownames(df_env)),
+              c("imperv_100m","tree_100m","wood_100m")]
+
+cca_result <- cca(df_ca ~ ., data = df_env)
+
+
+# Display the summary of the CCA result
+summary(cca_result)
+
+# Plot the CCA result
+plot(cca_result)
+
+# extract loadings
+species_scores <- scores(cca_result, display="species")
+env_scores <- scores(cca_result, display="bp")  # bp for biplot scores (environmental variables)
+site_scores <- scores(cca_result, display="sites")
+contributions <- cca_result$CCA$v
+
+# combine into single data frame
+cca_df <- data.frame(
+  Site = rownames(site_scores),
+  CCA1 = site_scores[, 1],
+  CCA2 = site_scores[, 2]
+)
+
+species_df <- data.frame(
+  Species = rownames(species_scores),
+  CCA1 = species_scores[, 1],
+  CCA2 = species_scores[, 2],
+  Contribution = abs(contributions[, 1])
+)
+
+env_df <- data.frame(
+  Env = rownames(env_scores),
+  CCA1 = env_scores[, 1],
+  CCA2 = env_scores[, 2]
+)
+env_df$Env = str_replace_all(env_df$Env, c(imperv_100m="Imperviousness", 
+                          tree_100m="Tree Cover",
+                          wood_100m="Wood Cover"))
+
+# prey phylum
+species_df$Species 
+species_df$image = prey_img[match(species_df$Species,prey_img$taxa),"url"]
+  
+transparent <- function(img) {
+  magick::image_fx(img, expression = "0.5*a", channel = "alpha")
+}
+```
+
+```{r}
+# Plot using ggplot2
+ggplot() +
+  
+  # plot site distance from mean 
+  ggrepel::geom_label_repel(data=cca_df %>%
+                             left_join(df_patch[,c("Site","imperv_400m")],unmatched = "drop" ) %>%
+                              rename(Imperviousness = imperv_400m), 
+                           aes(x=CCA1, y=CCA2, label=Site, fill=Imperviousness), 
+                           size=4, fontface = "bold", color = "white") +
+  scale_fill_continuous(low = "#d9d9d9", high = "#252525", na.value = NA) +
+  # scale_color_gradient2(low = "#00AFBB", mid = "#E7B800", high = "#FC4E07") +
+  
+  # plot environmental loadings
+  geom_segment(data=env_df, aes(x=0, y=0, xend=CCA1, yend=CCA2), 
+               arrow=arrow(length=unit(0.2, "cm")), size=1, color = "#5ab4ac") +
+  ggrepel::geom_text_repel(data=env_df, aes(x=CCA1, y=CCA2, label=Env), 
+            hjust=-.2, vjust=-.2, size=3, color = "#5ab4ac") +
+
+  
+  # plot prey contributions
+  ggrepel::geom_text_repel(data=species_df, aes(x=CCA1, y=CCA2, label=Species, color=Contribution), 
+                           color = "black", size=2.5, fontface = "bold.italic") +
+
+  # plot icon of prey phylum
+  ggimage::geom_image(data=species_df, aes(x=CCA1, y=CCA2, image=image), image_fun = transparent, size=0.1) +
+  
+  
+  xlab("CCA1") + ylab("CCA2") + 
+  
+  # Customize legend text, position, and background.
+  theme(
+    
+    panel.background = element_blank(),
+    legend.text = element_text(size = 7, family = "Roboto"),
+    legend.title = element_text(face = "bold", size=8, family = "Roboto"),
+    legend.position = c(.8, .3),
+    legend.key.height= unit(1, 'cm'),
+    legend.key.width= unit(.3, 'cm'),
+    legend.justification = c(0, 0),
+    legend.background = element_blank(),
+    # This one removes the background behind each key in the legend
+    legend.key = element_blank()
+    )  ->
+  fig_cca
+
+fig_cca
+
+ggsave(plot = last_plot(),filename = paste0(dir_int,"Fig_CCA_prey-env.png"))
+```
+
+## 13. Pairwise Pianka Niche Overlap
+
+The Observed Index (Ojk) ranges from no overlap (Ojk = 0) to complete overlap (Ojk = 1) between group diets. Outputs provide 1- or 2-tailed 95% confidence interval with tail probability for the Observed Index compared to the histogram of simulated indices. The Standardized Effect Size (SES), converts the significance score into a standardized deviate for comparisons among sets of results. Large positive values of the SES indicate increasingly small upper-tail probabilities, and large negative values of SES indicate increasingly small lower-tail probabilities. Non-significant tail probabilities usually fall between -2.0 and +2.0.
+
+### 13.1 Define site pairs
+
+```{r}
+df_pianka = df_site_freq
+
+# iterate for each pair of sites
+combn(rownames(df_pianka), 2) -> site_pair
+# create function to relocate results
+my.file.rename <- function(from, to) {
+    todir <- dirname(to)
+    if (!isTRUE(file.info(todir)$isdir)) dir.create(todir, recursive=TRUE)
+    file.rename(from = from,  to = to)
+}
+```
+
+### 13.2 Limit to prey in \5% pellets
+
+```{r}
+df_ca = df_site_freq
+# is similar to PCoA but cannot handle NA, convert NA to 0
+df_ca[is.na(df_ca)] <- 0
+# additionally, will not work well with very low values, so requires integers
+df_ca = df_ca * 100
+# number of pellets considered
+n_pell =
+  length(unique(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           "sample"]))
+
+# occurrence of each prey taxa
+per_prey_occur = 
+sort(table(unique.data.frame(
+  df.input[df.input$site %in% rownames(df_ca), # use only sites in analysis
+           c("sample","prey.id")])$prey.id),
+  decreasing = T # from most to least
+  ) / n_pell # occurence in what proportion of pellets
+
+# names of common prey
+perprey = names(per_prey_occur[per_prey_occur > 0.05])
+if (BOLDIGG.I==TRUE) {
+  perprey = names(per_prey_occur[per_prey_occur > 0.05])
+}
+
+df_pianka = df_site_freq[,c(perprey)]
+
+
+```
+
+### 13.3 Run EcoSimR
+
+Requires modifying the file "EcoSimR - Niche Overlap Shell - Porto.R" with correct route to EcoSim directory.
+
+```{r, eval=TRUE}
+if (!exists("df_pianka")){
+  df_pianka = df_site_freq
+}
+
+site_order = c("P.Avioso","Mindelo","P.Cidade","P.Oriental","Ramalde","Matosinhos")
+df_pianka = df_pianka[match(site_order,rownames(df_pianka)),]
+
+combn(rownames(df_pianka), 2) -> site_pair
+
+pianka.in = "EcoSimR_1.00_24Jun2013/"
+
+pianka.dir = paste0(dir_int,"EcoSimR_out/")
+dir.create(pianka.dir, 
+           showWarnings = FALSE,
+           recursive = TRUE)
+unlink(pianka.dir)
+dir.create(pianka.dir)
+
+df_pianka[is.na(df_pianka)] = 0 # set NA as 0 for PCA
+
+# save results
+Ojk <- list()
+SES <- list()
+# run scripts
+for (i in 1:ncol(site_pair)){
+  write.csv(df_pianka[rownames(df_pianka) %in% c(site_pair[,i]), # select site pair
+                    ],
+          paste0(pianka.in,"site_pair.csv"),row.names = T)
+  source(paste0(pianka.in,"EcoSimR - Niche Overlap Shell - Porto.R"))
+  x <- file(paste0(pianka.in,"Niche Overlap Output.txt"))
+  open(x)
+  Ojk[i] <- readLines(x)[9]
+  Ojk[i] <- as.numeric(stringr::str_sub(Ojk[i],17,(17+4)))
+  close(x)
+  y <- file(paste0(pianka.in,"Niche Overlap Output.txt"))
+  open(y)
+  SES[i] <- readLines(y)[19]
+  SES[i] <- as.numeric(stringr::str_sub(SES[i],34,(33+4)))
+  close(y)
+}
+pianka_pair = cbind.data.frame(site_pair[1,],site_pair[2,],unlist(Ojk),unlist(SES))
+colnames(pianka_pair) <- c("j","k","Ojk","SES")
+```
+
+### 13.4 Convert to matrix
+
+Convert the result into a matrix for each of comparison.
+
+```{r, eval=T}
+# convert to a matrix
+pivot_wider(pianka_pair[,1:3], names_from = j, 
+            values_from = Ojk ) -> 
+  pianka_Ojk_matrix
+write.csv(pianka_Ojk_matrix, paste0(pianka.dir,"pianka_matrix.csv"))
+pivot_wider(pianka_pair[,c(1,2,4)], names_from = j, 
+            values_from = SES) -> pianka_SES_matrix
+```
+
+The Observed Index (Ojk) where 0 = no overlap and 1 = complete overlap
+
+```{r, eval=T}
+pianka_Ojk_matrix
+```
+
+The Standardized Effect Size (SES) where non-significant values range -2 to 2
+
+```{r, eval=T}
+pianka_SES_matrix
+```
+
+### 13.5 Mantel Niche X Freq, Env, Headshape
+
+```{r}
+Ojk_dist = 
+  as.dist(rbind(
+    rep(NA,ncol(pianka_Ojk_matrix)-1),
+    pianka_Ojk_matrix[1,-1],
+    pianka_Ojk_matrix[2,-1],
+    pianka_Ojk_matrix[3,-1],
+    pianka_Ojk_matrix[4,-1],
+    pianka_Ojk_matrix[5,-1]
+    ))
+```
+
+
+[EcoSim plots](https://gotellilab.github.io/Bio381/StudentPresentations/EcoSimRPres_MSouthgate.html) [ggtile](https://r-charts.com/correlation/heat-map-ggplot2/)
+
+```{r, eval=T}
+meltOjk = reshape2::melt(pianka_Ojk_matrix, na.rm = T)
+colnames(meltOjk) = c("k","j","Ojk")
+meltSES = reshape2::melt(pianka_SES_matrix, na.rm = T)
+colnames(meltSES) = c("k","j","SES")
+
+melt_pianka = merge.data.frame(meltOjk,meltSES)
+
+## identify significant pairs
+text_size = melt_pianka$SES
+text_size[text_size < 2] <- NA
+text_size[text_size >= 2] <- "*"
+
+
+## plot
+ggplot(melt_pianka, aes(x = k, y = j, fill = Ojk)) +
+  geom_tile() +
+  coord_fixed() +
+  geom_text(aes(label = Ojk), color = "white", size = 4) + 
+  xlim(names(table(melt_pianka$k)[order(table(melt_pianka$k))])) +
+  #ylim(names(table(melt_pianka$j)[order(table(melt_pianka$k))])) +
+  theme(axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.text.x = element_text(angle=45, hjust = 1),
+    axis.title.x=element_blank(), #remove x axis labels
+    axis.title.y=element_blank()) +  #remove y axis labels
+  scale_fill_gradientn(colors = hcl.colors(20, "Earth")) +
+  geom_text(aes(label = text_size), color = "white", size = 10, vjust = 0.2) +
+  guides(fill = guide_colourbar(barwidth = 0.5,
+                                barheight = 13)) -> fig_pianka
+
+
+fig_pianka
+
+ggsave(paste0(dir_int,"Fig_pianka-matrix.png"))
+
+```
+
+```{r, eval=T}
+
+design <- "
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1122
+  1144
+"
+fig_preyfreq + fig_pianka + 
+  plot_layout(design = design) +
+  plot_annotation(tag_levels = 'A')
+
+ggsave(paste0(dir_int,"Fig_joined_plots.png"),
+       last_plot(),
+       device = "png",
+       dpi = 300, height = 15, width = 25, units = "cm")
+```
+
+### 13.6 Niche vs Morph
+
+```{r}
+mantel_niche = list()
+
+for ( i in seq_along(dist_morph)){
+mantel_niche[[i]] = 
+  mantel(dist_morph[[i]] %>% tibble::column_to_rownames('X'), 
+       Ojk_dist, 
+       method = "pearson", permutations = 999,na.rm = T)
+}
+
+for ( j in seq_along(dist_env_i)){
+i = i + 1
+    mantel_niche[[i]] = 
+    mantel_niche[[length(mantel_niche)+1]] =
+      mantel(dist_env_i[[j]], Ojk_dist,
+             method = "pearson", permutations = 999,na.rm = T)
+}
+
+
+v = c("Shape.Mean","Shape.Distance","Shape.Angle","Shape.Length",
+      names(dist_env_i))
+r = list()
+p = list()
+for (i in seq_along(mantel_niche)){
+  r[[i]] = mantel_niche[[i]]$statistic 
+  p[[i]] = mantel_niche[[i]]$signif
+}
+
+pianka_mantel =
+  cbind.data.frame(v,unlist(r),unlist(p)) %>% 
+  `colnames<-`(c("comparison","R","P")) %>%
+  mutate(across('comparison', str_replace, 'imperv_', 'IS.'))%>% 
+  mutate(across('comparison', str_replace, 'area_', 'SA.'))%>% 
+  mutate(across('comparison', str_replace, 'tree_', 'TC.'))%>% 
+  mutate(across('comparison', str_replace, 'wood_', 'WF.'))
+
+saveRDS(pianka_mantel, paste0(dir_int,"SM_pianka_mantel_results.Rds"))
+
+
+```
+
+
+Export the distance matrices for Lucia to use.
+
+```{r}
+dist.in.pianka = pianka_pair
+dist.in.env    = in_pca_env
+dist.in.prey   = df_site_freq[,perprey]
+dist.in.arth   = df_site_freq[,taxa[[1]]]
+dist.in.moll   = df_site_freq[,taxa[[2]]]
+dist.in.anne   = df_site_freq[,taxa[[3]]]
+
+dist.in = list(dist.in.anne,dist.in.moll,dist.in.arth,dist.in.prey,dist.in.env,dist.in.pianka)
+
+saveRDS(
+  dist.in,
+  paste0(dir_int,"/distance_matrices_input.Rds")
+)
+```
